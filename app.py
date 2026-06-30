@@ -433,8 +433,9 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
             writer(in_path, items, done_path)
             with open(done_path, 'rb') as f:
                 done_data = f.read()
+            # v15.3: 文件名格式 = 日期 + 原始文件名 (例 20260630郑总-6月份18k-培育钻(44).xlsx)
             base = uploaded.name.rsplit('.', 1)[0]
-            done_fname = f'{base}_完成_{datetime.now().strftime("%H%M%S")}.xlsx'
+            done_fname = f'{datetime.now().strftime("%Y%m%d")}{base}.xlsx'
             st.download_button(
                 "📥 下载工厂单 _完成.xlsx",
                 data=done_data, file_name=done_fname,
