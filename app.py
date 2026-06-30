@@ -85,19 +85,16 @@ with col3:
 with col4:
     au = st.number_input("黄金价", value=900.0, step=1.0, format="%.2f")
 
-# 永远包含现货件 (v13 移除选项)
+# v15: 对齐终端 process.py
+# - 工厂单 _完成.xlsx 永远生成 (基础产物)
+# - 有客户单 + 飞书连通 → 自动查飞书 (要写入完成文件的客户名 / 利润)
+# - 现货件永远包含
 include_spots = True
-# 查飞书: 飞书连通就默认勾上
-use_feishu = st.checkbox(
-    "查飞书补客户名/利润/圈号/主石",
-    value=feishu_ready,
-    disabled=not feishu_ready,
-)
+use_feishu = feishu_ready   # 隐式: 有客户单就查 (不再让用户选)
 
 st.divider()
-st.markdown("**🎯 任务**（至少选一项）:")
+st.markdown("**附加产物**（可选, 不勾也会生成工厂单完成文件）:")
 
-# v13: 两个独立任务
 col_a, col_b = st.columns(2)
 with col_a:
     do_jst = st.checkbox(
@@ -171,17 +168,8 @@ if uploaded is not None:
         st.info("💎 文件名含「天然钻石」→ 主石类别会写'天然钻石', 商品名加'天然'前缀")
 
 # ---------------- 主流程 ----------------
-# 必须勾至少一项任务才能点
-can_run = uploaded is not None and (do_jst or sync_feishu)
-btn_label = "🚀 开始"
-if do_jst and sync_feishu:
-    btn_label = "🚀 生成入库 Excel + 同步飞书"
-elif do_jst:
-    btn_label = "🚀 生成聚水潭入库 Excel"
-elif sync_feishu:
-    btn_label = "🚀 同步成本到飞书"
-
-if st.button(btn_label, disabled=not can_run, type="primary"):
+# v15: 只要有上传文件就能跑 (即使两个附加任务都没勾, 工厂单完成文件也会生成)
+if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
     try:
         suffix = '.xlsx'
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
@@ -216,16 +204,16 @@ if st.button(btn_label, disabled=not can_run, type="primary"):
 
         st.success(f"✓ 解析 {len(items)} 件 — 客户单 {len(clients)} | 现货 {len(spots)} | 修理 {len(repairs)}")
 
-        # ============== v14: 飞书查询 + 同步 (合并 + 实时打印详情) ==============
+        # ============== v15: 飞书查询 + 同步 (有客户单自动查) ==============
         feishu_hit = 0
         feishu_miss = []
         write_ok = refunded = accumulated = 0
         write_fails = []
         detail_lines = []
-        need_feishu = (use_feishu or sync_feishu) and clients and feishu_ready
+        need_feishu = clients and feishu_ready   # 有客户单 + 飞书连通就查
 
         if need_feishu:
-            label = '查飞书' + (' + 写镶嵌成本' if sync_feishu else '')
+            label = '查飞书' + (' + 写镶嵌成本' if sync_feishu else ' (只读, 不写)')
             st.subheader(f"🔍 Step: {label}")
             st.caption("✓ 正常 / ⚠ 异常需关注 / ✗ 失败")
             placeholder = st.empty()
@@ -437,41 +425,43 @@ if st.button(btn_label, disabled=not can_run, type="primary"):
                 except OSError:
                     pass
 
-        # ============== v14.1: 生成工厂单 _完成.xlsx 给下载 ==============
-        if need_feishu and sync_feishu:
-            st.subheader("📑 工厂单完成文件")
+        # ============== v15: 工厂单 _完成.xlsx 永远生成 (对齐终端) ==============
+        st.subheader("📑 工厂单完成文件")
+        try:
+            writer = factories.get_writer(code)
+            done_path = tempfile.mktemp(suffix='.xlsx')
+            writer(in_path, items, done_path)
+            with open(done_path, 'rb') as f:
+                done_data = f.read()
+            base = uploaded.name.rsplit('.', 1)[0]
+            done_fname = f'{base}_完成_{datetime.now().strftime("%H%M%S")}.xlsx'
+            st.download_button(
+                "📥 下载工厂单 _完成.xlsx",
+                data=done_data, file_name=done_fname,
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                key=f'dl_done_{datetime.now().timestamp()}',
+                type="primary",
+            )
+            cap_parts = []
+            if clients: cap_parts.append("客户名/利润/利润率")
+            if spots: cap_parts.append("现货 AD 单价成本")
+            st.caption(f"含 {' + '.join(cap_parts)}" if cap_parts else "已格式化")
+            st.session_state.setdefault('history', []).append({
+                '时间': datetime.now().strftime('%H:%M:%S'),
+                '类型': '工厂单完成',
+                '工厂': code,
+                '件数': len(items),
+                '文件名': done_fname,
+                '_data': done_data,
+            })
             try:
-                # 把客户名(已退款会改成 X已退款做现货) + 利润 + 利润率 回写到工厂账单
-                writer = factories.get_writer(code)
-                done_path = tempfile.mktemp(suffix='.xlsx')
-                writer(in_path, items, done_path)
-                with open(done_path, 'rb') as f:
-                    done_data = f.read()
-                base = uploaded.name.rsplit('.', 1)[0]
-                done_fname = f'{base}_完成_{datetime.now().strftime("%H%M%S")}.xlsx'
-                st.download_button(
-                    "📥 下载工厂单 _完成.xlsx",
-                    data=done_data, file_name=done_fname,
-                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                    key=f'dl_done_{datetime.now().timestamp()}',
-                )
-                st.caption(f"含客户名 / 利润 / 利润率 (已退款件已标记)")
-                st.session_state.setdefault('history', []).append({
-                    '时间': datetime.now().strftime('%H:%M:%S'),
-                    '类型': '工厂单完成',
-                    '工厂': code,
-                    '件数': len(items),
-                    '文件名': done_fname,
-                    '_data': done_data,
-                })
-                try:
-                    os.unlink(done_path)
-                except OSError:
-                    pass
-            except Exception as e:
-                st.error(f"生成工厂单完成文件失败: {e}")
-                with st.expander("详细错误"):
-                    st.code(traceback.format_exc())
+                os.unlink(done_path)
+            except OSError:
+                pass
+        except Exception as e:
+            st.error(f"生成工厂单完成文件失败: {e}")
+            with st.expander("详细错误"):
+                st.code(traceback.format_exc())
 
         try:
             os.unlink(in_path)
