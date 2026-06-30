@@ -16,6 +16,7 @@ COL = {
     '商品编码': 11, '商品名称': 12, '指圈号': 13, '数量': 14,
     '折后价': 15, '直径大小': 16, '成本1': 17, '成本2': 18, '成本价': 19,
     '分类': 20, '品牌': 21, '供应商名称': 22, '供应商名': 23,
+    '客户名称': 24,   # v15.1 新增
 }
 
 SUPPLIER_MAP = {
@@ -206,6 +207,21 @@ def build_row_from_item(item, factory_code, feishu_cert,
     cost1 = (feishu_luozuan or 0) + (feishu_peishi or 0)
     row['成本1'] = round(cost1, 2) if cost1 > 0 else None
     row['成本价'] = round((row['成本1'] or 0) + (row['成本2'] or 0), 2) if (row['成本1'] or row['成本2']) else None
+
+    # v15.1: 客户名称 (同终端 process.py 逻辑)
+    # - 客户单: 飞书客户名 (含已退款"X已退款做现货" 这种情况) / 没查到则 [待填]
+    # - 现货:   "现货"
+    # - 真诚:   "真诚"
+    cat = item.get('类别')
+    customer = item.get('飞书客户名')
+    if cat == '现货':
+        customer = customer or '现货'
+    elif cat == '部门-真诚':
+        customer = customer or '真诚'
+    elif cat == '客户单':
+        customer = customer or '[待填]'
+    if customer:
+        row['客户名称'] = customer
 
     return row
 
