@@ -4,7 +4,7 @@
 - 凭证: Streamlit Cloud Secrets 加密存
 """
 import streamlit as st
-import tempfile, os, traceback, re
+import tempfile, os, traceback, re, time
 from datetime import datetime
 
 import factories
@@ -16,6 +16,32 @@ st.set_page_config(page_title="聚水潭入库生成", page_icon="💎", layout=
 
 st.title("💎 聚水潭入库 Excel 生成")
 st.caption("上传工厂出货单 → 查飞书 → 生成聚水潭批量入库模板")
+
+# ---------------- 飞书工具 ----------------
+def _fetch_after_update(client, key, target_cost, max_wait=4):
+    """v14.2: 写完镶嵌成本后, 轮询飞书等公式刷新, 返回 (record, 是否成功刷新)
+    判断标准: 镶嵌成本字段已经变成 target_cost, 再等 0.5s 让利润公式算完
+    """
+    deadline = time.time() + max_wait
+    last_rec = None
+    while time.time() < deadline:
+        try:
+            rec = client.find_by_order_number(APP_TOKEN, TABLE_ID, key)
+        except Exception:
+            rec = None
+        if rec:
+            last_rec = rec
+            current_cost = client.get_number(rec['fields'].get('镶嵌成本'))
+            if current_cost is not None and abs(current_cost - target_cost) < 0.5:
+                time.sleep(0.5)
+                try:
+                    rec3 = client.find_by_order_number(APP_TOKEN, TABLE_ID, key)
+                except Exception:
+                    rec3 = None
+                return (rec3 or rec, True)
+        time.sleep(0.5)
+    return (last_rec, False)
+
 
 # ---------------- 飞书初始化 ----------------
 @st.cache_resource
@@ -55,9 +81,9 @@ factory_label = st.selectbox(
 
 col3, col4 = st.columns(2)
 with col3:
-    pt = st.number_input("铂金价 PT950 (元/g)", value=380.0, step=1.0, format="%.2f")
+    pt = st.number_input("铂金价", value=380.0, step=1.0, format="%.2f")
 with col4:
-    au = st.number_input("黄金价 18K (元/g)", value=900.0, step=1.0, format="%.2f")
+    au = st.number_input("黄金价", value=900.0, step=1.0, format="%.2f")
 
 # 永远包含现货件 (v13 移除选项)
 include_spots = True
@@ -87,16 +113,25 @@ with col_b:
     )
 
 overwrite = False
+debug_mode = False
 if sync_feishu:
     st.warning(
         "⚠️ **将写入飞书**: 修改「镶嵌成本」字段。"
         "默认叠加 (原值+今天值), 已退款件自动写 0。"
         "**确认这是今天的最新账单**再生成。"
     )
-    overwrite = st.checkbox(
-        "覆盖模式 (飞书已有成本时直接覆盖, 不叠加)",
-        value=False,
-    )
+    col_o, col_d = st.columns(2)
+    with col_o:
+        overwrite = st.checkbox(
+            "覆盖模式 (不叠加, 直接覆盖)",
+            value=False,
+        )
+    with col_d:
+        debug_mode = st.checkbox(
+            "🔬 诊断模式 (写入异常时打开)",
+            value=False,
+            help="详情行附加 record_id / 写入 payload / 飞书返回 code",
+        )
 
 
 # ---------------- 工厂识别 ----------------
@@ -249,6 +284,8 @@ if st.button(btn_label, disabled=not can_run, type="primary"):
                 final_cost = existing_cost
                 note = ''
                 write_failed = False
+                res = None
+                update_fields = {}
 
                 if sync_feishu:
                     if is_refunded:
@@ -274,17 +311,16 @@ if st.button(btn_label, disabled=not can_run, type="primary"):
                         if res.get('code') == 0:
                             write_ok += 1
                             if not is_refunded:
-                                # 等公式刷新拿最新利润
-                                try:
-                                    fresh = _client.find_by_order_number(
-                                        APP_TOKEN, TABLE_ID, key)
-                                    if fresh:
-                                        c['飞书利润'] = _client.get_number(
-                                            fresh['fields'].get('利润'))
-                                        c['飞书利润率'] = _client.get_number(
-                                            fresh['fields'].get('利润率'))
-                                except Exception:
-                                    pass
+                                # v14.2: 轮询飞书直到公式刷新拿最新利润
+                                fresh, fresh_ok = _fetch_after_update(
+                                    _client, key, final_cost, max_wait=4)
+                                if fresh:
+                                    c['飞书利润'] = _client.get_number(
+                                        fresh['fields'].get('利润'))
+                                    c['飞书利润率'] = _client.get_number(
+                                        fresh['fields'].get('利润率'))
+                                if not fresh_ok:
+                                    note += ' [⚠️公式刷新慢]'
                         else:
                             write_fails.append((c['no'], str(res)[:60]))
                             write_failed = True
@@ -312,6 +348,13 @@ if st.button(btn_label, disabled=not can_run, type="primary"):
                 cost_part = f"¥{final_cost}" if sync_feishu else f"飞书¥{int(existing_cost)}"
                 line = (f"  {mark} #{c['no']} {key} → {customer or '?'}  "
                         f"{cost_part}{note}  利润={profit_str} 利润率={rate_str}")
+                if debug_mode and sync_feishu:
+                    # 诊断: 显示 record_id + 写入 payload + 飞书返回
+                    rec_id = c.get('_record_id', '?')[-8:] if c.get('_record_id') else '?'
+                    payload = update_fields if sync_feishu else {}
+                    res_short = res.get('code') if isinstance(res, dict) else '?'
+                    res_msg = res.get('msg', '')[:30] if isinstance(res, dict) else ''
+                    line += f"\n      🔬 rid=…{rec_id} payload={payload} → code={res_short} msg={res_msg}"
                 append(line)
                 progress.progress((i + 1) / len(clients))
 
