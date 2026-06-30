@@ -181,120 +181,149 @@ if st.button(btn_label, disabled=not can_run, type="primary"):
 
         st.success(f"✓ 解析 {len(items)} 件 — 客户单 {len(clients)} | 现货 {len(spots)} | 修理 {len(repairs)}")
 
-        # ============== 查飞书 ==============
+        # ============== v14: 飞书查询 + 同步 (合并 + 实时打印详情) ==============
         feishu_hit = 0
         feishu_miss = []
-        if use_feishu and clients and feishu_ready:
-            with st.spinner(f"查飞书 ({len(clients)} 个客户单)..."):
-                progress = st.progress(0.0, "查询中...")
-                for i, c in enumerate(clients):
-                    key = c.get('飞书匹配键')
-                    if not key:
-                        feishu_miss.append((c['no'], '无匹配键'))
-                        continue
-                    try:
-                        rec = _client.find_by_order_number(APP_TOKEN, TABLE_ID, key)
-                        if not rec and c.get('证书编号'):
-                            rec = _client.find_by_cert(APP_TOKEN, TABLE_ID, str(c['证书编号']).strip())
-                    except Exception as e:
-                        feishu_miss.append((c['no'], f'API 错: {e}'))
-                        continue
-                    if not rec:
-                        feishu_miss.append((c['no'], f'未找到 ({key})'))
-                        continue
-                    c['_record_id'] = rec['record_id']
-                    fields = rec['fields']
-                    c['飞书客户名'] = _client.get_text(fields.get('客户名称'))
-                    c['飞书证书编码'] = _client.get_text(fields.get('证书编码'))
-                    c['飞书裸钻成本'] = _client.get_number(fields.get('裸钻成本')) or 0
-                    c['飞书配石成本'] = _client.get_number(fields.get('配石成本')) or 0
-                    c['飞书主石'] = _client.get_text(fields.get('主石'))
-                    c['飞书圈号'] = _client.get_text(fields.get('圈号'))
-                    c['飞书利润'] = _client.get_number(fields.get('利润'))
-                    c['飞书利润率'] = _client.get_number(fields.get('利润率'))
-                    c['_飞书原成本'] = _client.get_number(fields.get('镶嵌成本')) or 0
-                    # v12: 货物状态 (已退款分支)
-                    status_val = (fields.get('货物状态')
-                                  or fields.get('货品状态')
-                                  or fields.get('状态'))
-                    c['_飞书货物状态'] = _client.get_text(status_val) or ''
-                    feishu_hit += 1
-                    progress.progress((i + 1) / len(clients), f"{i + 1}/{len(clients)}")
-                progress.empty()
-            st.success(f"✓ 飞书匹配 {feishu_hit}/{len(clients)}")
-            if feishu_miss:
-                with st.expander(f"⚠️ {len(feishu_miss)} 件未匹配"):
-                    for no, why in feishu_miss:
-                        st.text(f"  #{no}: {why}")
+        write_ok = refunded = accumulated = 0
+        write_fails = []
+        detail_lines = []
+        need_feishu = (use_feishu or sync_feishu) and clients and feishu_ready
 
-        # ============== v12: 同步成本到飞书 ==============
-        if sync_feishu and clients and feishu_ready:
-            to_write = [c for c in clients if c.get('_record_id')]
-            if to_write:
-                st.subheader("✏️ 同步成本到飞书")
-                write_ok = 0
-                refunded = 0
-                accumulated = 0
-                write_fails = []
-                with st.spinner(f"写飞书 ({len(to_write)} 件)..."):
-                    progress2 = st.progress(0.0, "写入中...")
-                    for i, c in enumerate(to_write):
-                        today_cost = c['镶嵌成本']
-                        status_text = c.get('_飞书货物状态', '')
-                        is_refunded = '已退款' in status_text
-                        existing_cost = c.get('_飞书原成本') or 0
+        if need_feishu:
+            label = '查飞书' + (' + 写镶嵌成本' if sync_feishu else '')
+            st.subheader(f"🔍 Step: {label}")
+            st.caption("✓ 正常 / ⚠ 异常需关注 / ✗ 失败")
+            placeholder = st.empty()
+            progress = st.progress(0.0, "处理中...")
 
-                        if is_refunded:
-                            # 已退款 → 写 0, 客户名改"X已退款做现货"
-                            customer = c.get('飞书客户名')
-                            c['飞书客户名'] = f"{customer or '客户'}已退款做现货"
-                            new_cost = 0
-                            update_fields = {'镶嵌成本': 0}
-                            refunded += 1
-                            note = '[已退款→¥0]'
+            def append(line):
+                detail_lines.append(line)
+                placeholder.code('\n'.join(detail_lines), language=None)
+
+            for i, c in enumerate(clients):
+                key = c.get('飞书匹配键')
+                if not key:
+                    feishu_miss.append((c['no'], '无匹配键'))
+                    append(f"  ✗ #{c['no']} 无飞书匹配键")
+                    progress.progress((i + 1) / len(clients))
+                    continue
+                # 查
+                try:
+                    rec = _client.find_by_order_number(APP_TOKEN, TABLE_ID, key)
+                    if not rec and c.get('证书编号'):
+                        rec = _client.find_by_cert(APP_TOKEN, TABLE_ID, str(c['证书编号']).strip())
+                except Exception as e:
+                    feishu_miss.append((c['no'], f'API 错: {e}'))
+                    append(f"  ✗ #{c['no']} {key}: API 错 {e}")
+                    progress.progress((i + 1) / len(clients))
+                    continue
+                if not rec:
+                    feishu_miss.append((c['no'], f'未找到 ({key})'))
+                    append(f"  ✗ #{c['no']} {key} → 飞书找不到")
+                    progress.progress((i + 1) / len(clients))
+                    continue
+
+                c['_record_id'] = rec['record_id']
+                fields = rec['fields']
+                customer = _client.get_text(fields.get('客户名称'))
+                c['飞书客户名'] = customer
+                c['飞书证书编码'] = _client.get_text(fields.get('证书编码'))
+                c['飞书裸钻成本'] = _client.get_number(fields.get('裸钻成本')) or 0
+                c['飞书配石成本'] = _client.get_number(fields.get('配石成本')) or 0
+                c['飞书主石'] = _client.get_text(fields.get('主石'))
+                c['飞书圈号'] = _client.get_text(fields.get('圈号'))
+                c['飞书利润'] = _client.get_number(fields.get('利润'))
+                c['飞书利润率'] = _client.get_number(fields.get('利润率'))
+                existing_cost = _client.get_number(fields.get('镶嵌成本')) or 0
+                c['_飞书原成本'] = existing_cost
+                status_val = (fields.get('货物状态')
+                              or fields.get('货品状态')
+                              or fields.get('状态'))
+                status_text = _client.get_text(status_val) or ''
+                c['_飞书货物状态'] = status_text
+                is_refunded = '已退款' in status_text
+                feishu_hit += 1
+
+                # 写
+                today_cost = c['镶嵌成本']
+                final_cost = existing_cost
+                note = ''
+                write_failed = False
+
+                if sync_feishu:
+                    if is_refunded:
+                        c['飞书客户名'] = f"{customer or '客户'}已退款做现货"
+                        final_cost = 0
+                        update_fields = {'镶嵌成本': 0}
+                        refunded += 1
+                        note = ' [已退款→¥0]'
+                    else:
+                        if not overwrite and existing_cost > 0:
+                            final_cost = round(existing_cost + today_cost)
+                            accumulated += 1
+                            note = f' (原{int(existing_cost)}+{today_cost})'
                         else:
-                            if not overwrite and existing_cost > 0:
-                                new_cost = round(existing_cost + today_cost)
-                                accumulated += 1
-                                note = f'(原{int(existing_cost)}+{today_cost})'
-                            else:
-                                new_cost = today_cost
-                                note = ''
-                            update_fields = {'镶嵌成本': new_cost}
-                            # 裸钻成本空时初始化 0 (跟原 process.py 一致)
-                            if c.get('飞书裸钻成本') is None:
-                                update_fields['裸钻成本'] = 0
+                            final_cost = today_cost
+                        update_fields = {'镶嵌成本': final_cost}
+                        if c.get('飞书裸钻成本') is None:
+                            update_fields['裸钻成本'] = 0
 
-                        try:
-                            res = _client.update_record(
-                                APP_TOKEN, TABLE_ID, c['_record_id'], update_fields)
-                            if res.get('code') == 0:
-                                write_ok += 1
-                                # 取最新公式刷新值
-                                if not is_refunded:
-                                    fresh_rec = _client.find_by_order_number(
-                                        APP_TOKEN, TABLE_ID, c['飞书匹配键'])
-                                    if fresh_rec:
+                    try:
+                        res = _client.update_record(APP_TOKEN, TABLE_ID,
+                                                    c['_record_id'], update_fields)
+                        if res.get('code') == 0:
+                            write_ok += 1
+                            if not is_refunded:
+                                # 等公式刷新拿最新利润
+                                try:
+                                    fresh = _client.find_by_order_number(
+                                        APP_TOKEN, TABLE_ID, key)
+                                    if fresh:
                                         c['飞书利润'] = _client.get_number(
-                                            fresh_rec['fields'].get('利润'))
+                                            fresh['fields'].get('利润'))
                                         c['飞书利润率'] = _client.get_number(
-                                            fresh_rec['fields'].get('利润率'))
-                            else:
-                                write_fails.append((c['no'], str(res)[:80]))
-                        except Exception as e:
-                            write_fails.append((c['no'], str(e)[:80]))
-                        progress2.progress((i + 1) / len(to_write),
-                                           f"{i + 1}/{len(to_write)}")
-                    progress2.empty()
-                msg = f"✓ 写飞书 {write_ok}/{len(to_write)}"
-                if accumulated: msg += f" | 叠加 {accumulated}"
-                if refunded: msg += f" | 已退款 {refunded}"
-                if write_fails: msg += f" | 失败 {len(write_fails)}"
-                st.success(msg)
-                if write_fails:
-                    with st.expander(f"❌ {len(write_fails)} 件写入失败"):
-                        for no, why in write_fails:
-                            st.text(f"  #{no}: {why}")
+                                            fresh['fields'].get('利润率'))
+                                except Exception:
+                                    pass
+                        else:
+                            write_fails.append((c['no'], str(res)[:60]))
+                            write_failed = True
+                            note += f' [写失败 {str(res)[:30]}]'
+                    except Exception as e:
+                        write_fails.append((c['no'], str(e)[:60]))
+                        write_failed = True
+                        note += f' [写异常 {str(e)[:30]}]'
+
+                # 详情行
+                profit = c.get('飞书利润')
+                rate = c.get('飞书利润率')
+                profit_str = str(int(profit)) if isinstance(profit, (int, float)) else '?'
+                rate_str = f"{rate*100:.1f}%" if isinstance(rate, (int, float)) else '?'
+
+                # 异常标识: 写失败 / 已退款 / 利润率 < 15% 或 > 70% (这两阈值你可改)
+                mark = '✓'
+                if write_failed:
+                    mark = '✗'
+                elif is_refunded:
+                    mark = '⚠'
+                elif isinstance(rate, (int, float)) and (rate < 0.15 or rate > 0.70):
+                    mark = '⚠'
+
+                cost_part = f"¥{final_cost}" if sync_feishu else f"飞书¥{int(existing_cost)}"
+                line = (f"  {mark} #{c['no']} {key} → {customer or '?'}  "
+                        f"{cost_part}{note}  利润={profit_str} 利润率={rate_str}")
+                append(line)
+                progress.progress((i + 1) / len(clients))
+
+            progress.empty()
+            # 汇总
+            summary = f"✓ 飞书匹配 {feishu_hit}/{len(clients)}"
+            if sync_feishu:
+                summary += f" | 写入 {write_ok}"
+                if accumulated: summary += f" | 叠加 {accumulated}"
+                if refunded: summary += f" | 已退款 {refunded}"
+                if write_fails: summary += f" | 失败 {len(write_fails)}"
+            st.success(summary)
 
         # ============== v13: 生成入库 Excel (只在勾选时) ==============
         if do_jst:
@@ -341,18 +370,64 @@ if st.button(btn_label, disabled=not can_run, type="primary"):
                     st.dataframe(preview, use_container_width=True, hide_index=True)
 
                 with open(out_path, 'rb') as f:
-                    data = f.read()
-                fname = f'聚水潭入库_{code}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
+                    jst_data = f.read()
+                jst_fname = f'聚水潭入库_{code}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
                 st.download_button(
-                    "📥 下载聚水潭入库 Excel", data=data, file_name=fname,
+                    "📥 下载聚水潭入库 Excel", data=jst_data, file_name=jst_fname,
                     mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                     type="primary",
+                    key=f'dl_jst_{datetime.now().timestamp()}',
                 )
+                # session 历史 (聚水潭)
+                st.session_state.setdefault('history', []).append({
+                    '时间': datetime.now().strftime('%H:%M:%S'),
+                    '类型': '聚水潭入库',
+                    '工厂': code,
+                    '件数': added,
+                    '文件名': jst_fname,
+                    '_data': jst_data,
+                })
 
                 try:
                     os.unlink(out_path)
                 except OSError:
                     pass
+
+        # ============== v14.1: 生成工厂单 _完成.xlsx 给下载 ==============
+        if need_feishu and sync_feishu:
+            st.subheader("📑 工厂单完成文件")
+            try:
+                # 把客户名(已退款会改成 X已退款做现货) + 利润 + 利润率 回写到工厂账单
+                writer = factories.get_writer(code)
+                done_path = tempfile.mktemp(suffix='.xlsx')
+                writer(in_path, items, done_path)
+                with open(done_path, 'rb') as f:
+                    done_data = f.read()
+                base = uploaded.name.rsplit('.', 1)[0]
+                done_fname = f'{base}_完成_{datetime.now().strftime("%H%M%S")}.xlsx'
+                st.download_button(
+                    "📥 下载工厂单 _完成.xlsx",
+                    data=done_data, file_name=done_fname,
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    key=f'dl_done_{datetime.now().timestamp()}',
+                )
+                st.caption(f"含客户名 / 利润 / 利润率 (已退款件已标记)")
+                st.session_state.setdefault('history', []).append({
+                    '时间': datetime.now().strftime('%H:%M:%S'),
+                    '类型': '工厂单完成',
+                    '工厂': code,
+                    '件数': len(items),
+                    '文件名': done_fname,
+                    '_data': done_data,
+                })
+                try:
+                    os.unlink(done_path)
+                except OSError:
+                    pass
+            except Exception as e:
+                st.error(f"生成工厂单完成文件失败: {e}")
+                with st.expander("详细错误"):
+                    st.code(traceback.format_exc())
 
         try:
             os.unlink(in_path)
@@ -363,6 +438,29 @@ if st.button(btn_label, disabled=not can_run, type="primary"):
         st.error(f"❌ 出错: {e}")
         with st.expander("详细错误"):
             st.code(traceback.format_exc())
+
+# ---------------- 本次会话历史 ----------------
+st.divider()
+hist = st.session_state.get('history', [])
+if hist:
+    st.subheader(f"📚 本次会话生成记录 ({len(hist)} 份)")
+    st.caption("⚠️ 浏览器关掉就清空, 重要的请存到本地")
+    for idx, h in enumerate(reversed(hist)):
+        col_a, col_b, col_c, col_d = st.columns([1.5, 2, 1, 2.5])
+        with col_a:
+            st.text(f"🕐 {h['时间']}")
+        with col_b:
+            st.text(f"{h['类型']} ({h['工厂']})")
+        with col_c:
+            st.text(f"{h['件数']} 件")
+        with col_d:
+            st.download_button(
+                "📥 重下载",
+                data=h['_data'],
+                file_name=h['文件名'],
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                key=f'redown_{idx}_{h["时间"]}',
+            )
 
 # ---------------- 说明 ----------------
 st.divider()

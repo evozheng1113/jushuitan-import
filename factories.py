@@ -1,8 +1,194 @@
-"""4 家工厂解析逻辑 (网站精简版 v23.11)
-只保留 parse_*, 删除 write_* / XML patch (网站不回写工厂表)
+"""4 家工厂解析 + 回写 (网站完整版 v23.11)
+- parse_*: 解析工厂账单 → items
+- write_*: 把客户名/利润/利率回写到工厂账单 → _完成.xlsx
 """
-import openpyxl, re, os, subprocess, tempfile
+import openpyxl, math, re, os, subprocess, shutil, zipfile
 from datetime import datetime, date
+
+
+def _safe_copy(src, dst):
+    shutil.copy(src, dst)
+    os.chmod(dst, 0o644)
+
+
+def _col_letter(n):
+    s = ''
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _col_num(letters):
+    n = 0
+    for ch in letters:
+        n = n * 26 + (ord(ch.upper()) - 64)
+    return n
+
+
+def _fmt_num_for_text(val):
+    if isinstance(val, int):
+        return str(val)
+    if isinstance(val, float):
+        if val == int(val):
+            return str(int(val))
+        return f"{val:.2f}".rstrip('0').rstrip('.')
+    return str(val)
+
+
+def _make_cell_xml(cell_ref, val, cached=None, preserve_attrs='', force_general=False):
+    attrs = re.sub(r'\s*t="[^"]*"', '', preserve_attrs)
+    if force_general:
+        attrs = re.sub(r'\s*s="[^"]*"', '', attrs)
+        if isinstance(val, (int, float)):
+            text = _fmt_num_for_text(val)
+            esc = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            return f'<c r="{cell_ref}"{attrs} t="inlineStr"><is><t>{esc}</t></is></c>'
+        elif isinstance(val, str) and not val.startswith('='):
+            esc = val.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            return f'<c r="{cell_ref}"{attrs} t="inlineStr"><is><t>{esc}</t></is></c>'
+    if isinstance(val, str) and val.startswith('='):
+        v_xml = f'<v>{cached}</v>' if cached is not None else ''
+        return f'<c r="{cell_ref}"{attrs}><f>{val[1:]}</f>{v_xml}</c>'
+    elif isinstance(val, (int, float)):
+        return f'<c r="{cell_ref}"{attrs} t="n"><v>{val}</v></c>'
+    else:
+        esc = str(val).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        return f'<c r="{cell_ref}"{attrs} t="inlineStr"><is><t>{esc}</t></is></c>'
+
+
+_CELL_TAG_RE = re.compile(r'<c r="([A-Z]+)(\d+)"[^>]*?(?:/>|>.*?</c>)', re.DOTALL)
+
+
+def _insert_cell_in_order(row_content, new_cell_xml, col_num):
+    insert_pos = None
+    for m in _CELL_TAG_RE.finditer(row_content):
+        existing_col = _col_num(m.group(1))
+        if existing_col > col_num:
+            insert_pos = m.start()
+            break
+    if insert_pos is None:
+        return row_content + new_cell_xml
+    return row_content[:insert_pos] + new_cell_xml + row_content[insert_pos:]
+
+
+def _reorder_row_cells(row_content):
+    cells = []
+    for m in _CELL_TAG_RE.finditer(row_content):
+        cells.append((_col_num(m.group(1)), m.start(), m.end(), m.group(0)))
+    if len(cells) < 2:
+        return row_content
+    already_sorted = all(cells[i][0] < cells[i+1][0] for i in range(len(cells)-1))
+    if already_sorted:
+        return row_content
+    first_start = cells[0][1]
+    last_end = cells[-1][2]
+    sorted_cells = sorted(cells, key=lambda x: x[0])
+    new_cells_str = ''.join(c[3] for c in sorted_cells)
+    return row_content[:first_start] + new_cells_str + row_content[last_end:]
+
+
+def _patch_sheet_xml(xml, mods):
+    by_row = {}
+    for (r, c), v in mods.items():
+        by_row.setdefault(r, []).append((c, _col_letter(c), v))
+    for row_num, changes in by_row.items():
+        changes.sort(key=lambda x: x[0])
+        row_pattern = re.compile(rf'(<row r="{row_num}"[^>]*>)(.*?)(</row>)', re.DOTALL)
+        m = row_pattern.search(xml)
+        if not m:
+            continue
+        row_start, row_content, row_end = m.group(1), m.group(2), m.group(3)
+        new_content = row_content
+        for col_n, col_letter_s, v in changes:
+            opts = {}
+            if isinstance(v, tuple):
+                if len(v) >= 3:
+                    val, cached, opts = v[0], v[1], v[2]
+                elif len(v) == 2:
+                    val, cached = v
+                else:
+                    val, cached = v[0], None
+            else:
+                val, cached = v, None
+            cell_ref = f'{col_letter_s}{row_num}'
+            cell_re = re.compile(rf'<c r="{cell_ref}"([^>]*?)(?:/>|>(.*?)</c>)')
+            ex = cell_re.search(new_content)
+            preserve = ex.group(1) if ex else ''
+            new_cell = _make_cell_xml(cell_ref, val, cached, preserve,
+                                      force_general=opts.get('force_general', False))
+            if ex:
+                new_content = cell_re.sub(new_cell, new_content, count=1)
+            else:
+                new_content = _insert_cell_in_order(new_content, new_cell, col_n)
+        new_content = _reorder_row_cells(new_content)
+        xml = xml.replace(m.group(0), row_start + new_content + row_end)
+    return xml
+
+
+def _resolve_sheet_xml_path(xlsx_path, sheet_title):
+    with zipfile.ZipFile(xlsx_path) as z:
+        wb_xml = z.read('xl/workbook.xml').decode('utf-8')
+        rels_xml = z.read('xl/_rels/workbook.xml.rels').decode('utf-8')
+    sheet_m = re.search(rf'<sheet[^>]*name="{re.escape(sheet_title)}"[^>]*r:id="(rId\d+)"', wb_xml)
+    if not sheet_m:
+        sheet_m = re.search(rf'<sheet[^>]*r:id="(rId\d+)"[^>]*name="{re.escape(sheet_title)}"', wb_xml)
+    if not sheet_m:
+        return 'xl/worksheets/sheet1.xml'
+    rid = sheet_m.group(1)
+    rel_m = re.search(rf'<Relationship[^>]*Id="{rid}"[^>]*Target="([^"]+)"', rels_xml)
+    if not rel_m:
+        rel_m = re.search(rf'<Relationship[^>]*Target="([^"]+)"[^>]*Id="{rid}"', rels_xml)
+    if not rel_m:
+        return 'xl/worksheets/sheet1.xml'
+    target = rel_m.group(1)
+    if target.startswith('/'):
+        return target.lstrip('/')
+    if target.startswith('worksheets/'):
+        return 'xl/' + target
+    return 'xl/' + target
+
+
+def _patch_xlsx_cells(src_path, dst_path, modifications, sheet_name='sheet1', sheet_title=None):
+    _safe_copy(src_path, dst_path)
+    if sheet_title:
+        target = _resolve_sheet_xml_path(dst_path, sheet_title)
+    else:
+        target = f'xl/worksheets/{sheet_name}.xml'
+    tmp = dst_path + '.tmp'
+    with zipfile.ZipFile(dst_path) as zin:
+        with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for n in zin.namelist():
+                if n == target:
+                    data = zin.read(n).decode('utf-8')
+                    data = _patch_sheet_xml(data, modifications)
+                    zout.writestr(n, data.encode('utf-8'))
+                else:
+                    zout.writestr(n, zin.read(n))
+    os.replace(tmp, dst_path)
+
+
+def _ensure_xlsx(path):
+    if path.endswith('.xls') and not path.endswith('.xlsx'):
+        out = path.rsplit('.', 1)[0] + '.xlsx'
+        if not os.path.exists(out):
+            try:
+                subprocess.run(['soffice', '--headless', '--convert-to', 'xlsx',
+                                path, '--outdir', os.path.dirname(out) or '.'],
+                               check=True, timeout=30)
+            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                raise RuntimeError("无法处理 .xls 文件,请先用 Excel/WPS 另存为 .xlsx 再上传")
+        return out
+    return path
+
+
+def _fmt_profit_rate(v):
+    if v is None:
+        return None
+    try:
+        return f"{float(v) * 100:.1f}%"
+    except (TypeError, ValueError):
+        return str(v)
 
 
 def _is_silver(material):
@@ -30,21 +216,8 @@ def _unwrap_datetime_order(v):
     return v
 
 
-def _ensure_xlsx(path):
-    """.xls 自动转 .xlsx (网站环境若有 libreoffice 可用)
-    没有 libreoffice 直接抛错, 让用户上传 .xlsx
-    """
-    if path.endswith('.xls') and not path.endswith('.xlsx'):
-        out = path.rsplit('.', 1)[0] + '.xlsx'
-        if not os.path.exists(out):
-            try:
-                subprocess.run(['soffice', '--headless', '--convert-to', 'xlsx',
-                                path, '--outdir', os.path.dirname(out) or '.'],
-                               check=True, timeout=30)
-            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-                raise RuntimeError("无法处理 .xls 文件，请先用 Excel/WPS 另存为 .xlsx 再上传")
-        return out
-    return path
+def _profit(val):
+    return (val, None, {'force_general': True})
 
 
 # ============ 工厂 A: 雅希 (广州厂) ============
@@ -63,7 +236,6 @@ def parse_A(excel_path, pt_price, au_price, sheet_name=None, **kw):
     if current_rows:
         items.append(_aggregate_A(ws, current_rows, pt_price, au_price))
 
-    # 旧金回收 合并到对应客户单
     processed_recycles = set()
     recycle_by_order = {}
     for it in items:
@@ -191,12 +363,70 @@ def _aggregate_A(ws, rows, pt_price, au_price):
         cost = round(gold_cost + s + g + l + z + o)
 
     fly_key = f'A-{order_str.strip()}' if cat == '客户单' and order else None
-    return {'no': no, '类别': cat, '下单编号': order, '单号': invoice, '证书编号': cert,
-            '品名': style, '成色': material, '件数': qty, '镶嵌成本': cost,
+    return {'no': no, 'rows': rows, '类别': cat, '下单编号': order, '单号': invoice, '证书编号': cert,
+            '品名': style, '成色': material, '件数': qty, '金价': gp, '镶嵌成本': cost,
             '总重': total_weight,
             '主石重量': main_w if main_w > 0 else None,
             '副石重量': side_w if side_w > 0 else None,
-            '飞书匹配键': fly_key}
+            '折铂金': sum_M, '折足金': sum_N, '_is_silver': is_silver,
+            '_pt_price': pt_price, '_au_price': au_price,
+            '飞书匹配键': fly_key, '飞书客户名': None}
+
+
+def write_A(excel_path, items, out_path):
+    modifications = {}
+    for it in items:
+        r = it['rows'][0]
+        is_silver = it.get('_is_silver')
+        sum_M = it.get('折铂金') or 0
+        sum_N = it.get('折足金') or 0
+        pt = it.get('_pt_price') or 0
+        au = it.get('_au_price') or 0
+
+        write_gold = it['类别'] in ('客户单', '现货', '部门-真诚') and not is_silver
+        if write_gold and (sum_M > 0 or sum_N > 0):
+            if sum_M > 0 and sum_N == 0:
+                modifications[(r, 15)] = pt
+                cached = round(pt * sum_M, 4)
+                modifications[(r, 16)] = (f'=O{r}*M{r}', cached)
+            elif sum_N > 0 and sum_M == 0:
+                modifications[(r, 15)] = au
+                cached = round(au * sum_N, 4)
+                modifications[(r, 16)] = (f'=O{r}*N{r}', cached)
+            else:
+                modifications[(r, 15)] = pt
+                cached = round(pt * sum_M + au * sum_N, 4)
+                modifications[(r, 16)] = cached
+
+        if it['类别'] in ('客户单', '现货', '部门-真诚') and it.get('镶嵌成本') and not is_silver:
+            modifications[(r, 28)] = it['镶嵌成本']
+
+        ac_map = {'现货': '现货', '修理': '修理', '旧金回收': '旧金回收',
+                  '部门-真诚': '真诚', '内部-跳过': '内部', '退还': '退还'}
+        ac = ac_map.get(it['类别'])
+        if not ac and it['类别'] == '客户单':
+            ac = it.get('飞书客户名') or '[待填]'
+        if ac:
+            modifications[(r, 29)] = ac
+
+        # 现货 AD = ceil(AB / H)
+        if it['类别'] == '现货' and it.get('镶嵌成本') and it.get('件数'):
+            try:
+                qty_n = int(it['件数']) if it['件数'] else 1
+                if qty_n > 0:
+                    unit_cost = math.ceil(float(it['镶嵌成本']) / qty_n)
+                    modifications[(r, 30)] = unit_cost
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+
+        if it['类别'] == '客户单':
+            profit = it.get('飞书利润')
+            if isinstance(profit, (int, float)):
+                modifications[(r, 30)] = _profit(profit)
+            rate = _fmt_profit_rate(it.get('飞书利润率'))
+            if rate is not None:
+                modifications[(r, 31)] = _profit(rate)
+    _patch_xlsx_cells(excel_path, out_path, modifications)
 
 
 # ============ 工厂 B: 倾诚 ============
@@ -205,6 +435,7 @@ def parse_B(excel_path, sheet_name=None, **kw):
     ws = wb[sheet_name] if sheet_name else wb[wb.sheetnames[-1]]
     REPAIR = ['换扣', '旧扣抵扣', '加链', '换链', '换细链', '换粗链']
     items = []
+    sheet_idx = wb.sheetnames.index(ws.title)
     for r in range(9, ws.max_row + 1):
         a = ws.cell(row=r, column=1).value
         if not isinstance(a, (int, float)):
@@ -224,9 +455,7 @@ def parse_B(excel_path, sheet_name=None, **kw):
             cat = '维修'
         elif not inv:
             cat = '现货'
-        elif re.match(r'^\d+-\d+-\d+$', inv):
-            cat = '客户单'
-        elif re.match(r'^B-\d+-\d+-\d+$', inv):
+        elif re.match(r'^\d+-\d+-\d+$', inv) or re.match(r'^B-\d+-\d+-\d+$', inv):
             cat = '客户单'
         elif inv.lower().startswith('tb'):
             cat = '客户单'
@@ -236,7 +465,6 @@ def parse_B(excel_path, sheet_name=None, **kw):
             cat = '现货'
         else:
             cat = '客户单'
-        # 飞书匹配键
         fly_key = None
         if cat == '客户单':
             if inv.startswith('B-'):
@@ -245,11 +473,37 @@ def parse_B(excel_path, sheet_name=None, **kw):
                 fly_key = f'B-{inv}'
             else:
                 fly_key = inv
-        items.append({'no': no, '类别': cat, '品名': pinming, '单号': invoice,
+        items.append({'no': no, 'rows': [r], '类别': cat, '品名': pinming, '单号': invoice,
                       '成色': material, '件数': qty, '镶嵌成本': round(total),
                       '总重': total_weight,
-                      '飞书匹配键': fly_key})
+                      '飞书匹配键': fly_key,
+                      '_sheet_idx': sheet_idx, '_sheet_title': ws.title})
     return items
+
+
+def write_B(excel_path, items, out_path):
+    modifications = {}
+    sheet_title = items[0].get('_sheet_title') if items else None
+    for it in items:
+        r = it['rows'][0]
+        ac = None
+        if it['类别'] == '现货':
+            ac = '现货'
+        elif it['类别'] == '维修':
+            ac = it.get('飞书客户名') or it.get('飞书匹配键') or '[待填]'
+        elif it['类别'] == '客户单':
+            ac = it.get('飞书客户名') or '[待填]'
+        if ac:
+            modifications[(r, 29)] = ac
+        if it['类别'] == '客户单':
+            profit = it.get('飞书利润')
+            if isinstance(profit, (int, float)):
+                modifications[(r, 30)] = _profit(profit)
+            rate = _fmt_profit_rate(it.get('飞书利润率'))
+            if rate is not None:
+                modifications[(r, 31)] = _profit(rate)
+    _patch_xlsx_cells(excel_path, out_path, modifications,
+                      sheet_name='sheet1', sheet_title=sheet_title)
 
 
 # ============ 工厂 D: 黛宝 ============
@@ -263,6 +517,7 @@ def parse_D(excel_path, pt_price, au_price, **kw):
         if not isinstance(a, (int, float)):
             continue
         no = int(a)
+        barcode = ws.cell(row=r, column=2).value
         kuanhao = ws.cell(row=r, column=3).value
         name = ws.cell(row=r, column=7).value
         material = ws.cell(row=r, column=8).value
@@ -280,6 +535,7 @@ def parse_D(excel_path, pt_price, au_price, **kw):
         ms = str(material or '').upper()
         is_silver = _is_silver(material)
         if is_silver:
+            gp = 0
             cost = round(AL)
         else:
             if 'PT950' in ms:
@@ -287,12 +543,36 @@ def parse_D(excel_path, pt_price, au_price, **kw):
             else:
                 gp = au_price
             cost = round(zhezu * gp + AL) if gp else round(AL)
-        items.append({'no': no, '类别': cat, '款号': kuanhao,
-                      '证书编号': cert, '品名': name, '成色': material,
-                      '件数': 1, '镶嵌成本': cost,
-                      '总重': total_weight,
-                      '飞书匹配键': fly_key})
+        items.append({'no': no, 'rows': [r, r + 1], '类别': cat, '条码号': barcode, '款号': kuanhao,
+                      '证书编号': cert, '品名': name, '成色': material, '件数': 1, '金价': gp,
+                      '折足': zhezu, '工石费': AL, '镶嵌成本': cost,
+                      '总重': total_weight, '_is_silver': is_silver,
+                      '飞书匹配键': fly_key, '飞书客户名': None})
     return items
+
+
+def write_D(excel_path, items, out_path):
+    excel_path = _ensure_xlsx(excel_path)
+    modifications = {}
+    for it in items:
+        r = it['rows'][0]
+        gp = it['金价']
+        if it.get('_is_silver') or not gp:
+            if it.get('镶嵌成本'):
+                modifications[(r, 39)] = it['镶嵌成本']
+        else:
+            cached = round(gp * (it['折足'] or 0) + (it['工石费'] or 0), 4)
+            modifications[(r, 39)] = (f'={gp}*O{r}+AL{r}', cached)
+        an = '现货' if it['类别'] == '现货' else (it.get('飞书客户名') or '[待填]')
+        modifications[(r, 40)] = an
+        if it['类别'] == '客户单':
+            profit = it.get('飞书利润')
+            if isinstance(profit, (int, float)):
+                modifications[(r, 41)] = _profit(profit)
+            rate = _fmt_profit_rate(it.get('飞书利润率'))
+            if rate is not None:
+                modifications[(r, 42)] = _profit(rate)
+    _patch_xlsx_cells(excel_path, out_path, modifications)
 
 
 # ============ 工厂 E: 猛哥 ============
@@ -309,8 +589,7 @@ def _detect_E_columns(ws):
     found = {}
     for c in range(1, 40):
         v = ws.cell(row=4, column=c).value
-        if not v:
-            continue
+        if not v: continue
         s = str(v).strip()
         for key in keys:
             if key in s and key not in found:
@@ -352,6 +631,7 @@ def _detect_E_columns(ws):
 def parse_E(excel_path, pt_price, au_price, sheet_name=None, default_material=None, **kw):
     wb = openpyxl.load_workbook(excel_path, data_only=True)
     ws = wb[sheet_name] if sheet_name else wb[wb.sheetnames[-1]]
+    sheet_idx = wb.sheetnames.index(ws.title)
     items = []
     auto_no_counter = 0
     COL = _detect_E_columns(ws)
@@ -459,26 +739,84 @@ def parse_E(excel_path, pt_price, au_price, sheet_name=None, default_material=No
         normalized = _normalize_order(invoice_s)
 
         if no == '19楼' or invoice_s == '19楼':
-            cat, fly_key = '部门-真诚', None
+            cat, fly_key, customer = '部门-真诚', None, '真诚'
         elif not invoice_s:
-            cat, fly_key = '现货', None
+            cat, fly_key, customer = '现货', None, '现货'
         elif ORDER_LIKE.match(invoice_s):
-            cat, fly_key = '客户单', f'E-{normalized}'
+            cat, fly_key, customer = '客户单', f'E-{normalized}', None
         else:
-            cat, fly_key = '客户单', invoice_s
+            cat, fly_key, customer = '客户单', invoice_s, None
 
-        items.append({'no': no, '类别': cat, '单号': invoice, '品名': pinming,
+        items.append({'no': no, 'rows': [r], '类别': cat, '单号': invoice, '品名': pinming,
                       '成色': material, '件数': qty,
                       '总重': total_weight,
                       '主石重量': main_w if main_w > 0 else None,
                       '副石重量': side_w if side_w > 0 else None,
-                      '镶嵌成本': cost,
-                      '飞书匹配键': fly_key})
+                      '含耗金重': han_hao, '折足金': zhe_zu, '金价': gp, '金值': jin_zhi,
+                      '_factory_K_filled': isinstance(factory_K, (int, float)) and factory_K != 0,
+                      '_factory_L_filled': isinstance(factory_L, (int, float)) and factory_L > 0,
+                      '_factory_M_filled': isinstance(factory_M, (int, float)) and factory_M > 0,
+                      '镶嵌成本': cost, '_is_silver': is_silver,
+                      '_E_COL': COL,
+                      '飞书匹配键': fly_key, '飞书客户名': customer,
+                      '_sheet_idx': sheet_idx, '_sheet_title': ws.title})
     return items
 
 
+def write_E(excel_path, items, out_path):
+    if not items:
+        return
+    COL = items[0].get('_E_COL') or {}
+    modifications = {}
+    sheet_title = items[0].get('_sheet_title')
+    af_col = COL.get('总金额', 32)
+    name_col = af_col + 1
+    profit_col = af_col + 2
+    rate_col = af_col + 3
+    for it in items:
+        r = it['rows'][0]
+        is_silver = it.get('_is_silver')
+
+        if not is_silver and not it.get('_factory_K_filled') and it.get('折足金'):
+            modifications[(r, COL.get('折足金', 11))] = it['折足金']
+        if not is_silver and not it.get('_factory_L_filled') and it.get('金价'):
+            modifications[(r, COL.get('金价', 12))] = it['金价']
+        if not is_silver and not it.get('_factory_M_filled') and it.get('金值'):
+            k_letter = _col_letter(COL.get('折足金', 11))
+            l_letter = _col_letter(COL.get('金价', 12))
+            modifications[(r, COL.get('金值', 13))] = (f'={k_letter}{r}*{l_letter}{r}', it['金值'])
+        if it.get('镶嵌成本'):
+            modifications[(r, af_col)] = it['镶嵌成本']
+
+        customer = it.get('飞书客户名')
+        if not customer:
+            if it['类别'] == '客户单':
+                customer = '[待填]'
+            elif it['类别'] == '现货':
+                customer = '现货'
+            elif it['类别'] == '部门-真诚':
+                customer = '真诚'
+        if customer:
+            modifications[(r, name_col)] = customer
+
+        if it['类别'] == '客户单':
+            profit = it.get('飞书利润')
+            if isinstance(profit, (int, float)):
+                modifications[(r, profit_col)] = _profit(profit)
+            rate = _fmt_profit_rate(it.get('飞书利润率'))
+            if rate is not None:
+                modifications[(r, rate_col)] = _profit(rate)
+    _patch_xlsx_cells(excel_path, out_path, modifications,
+                      sheet_name='sheet1', sheet_title=sheet_title)
+
+
 PARSERS = {'A': parse_A, 'B': parse_B, 'D': parse_D, 'E': parse_E}
+WRITERS = {'A': write_A, 'B': write_B, 'D': write_D, 'E': write_E}
 
 
 def get_parser(code):
     return PARSERS[code]
+
+
+def get_writer(code):
+    return WRITERS[code]
