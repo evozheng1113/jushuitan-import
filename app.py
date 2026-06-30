@@ -263,8 +263,9 @@ if st.button(btn_label, disabled=not can_run, type="primary"):
                 customer = _client.get_text(fields.get('客户名称'))
                 c['飞书客户名'] = customer
                 c['飞书证书编码'] = _client.get_text(fields.get('证书编码'))
-                c['飞书裸钻成本'] = _client.get_number(fields.get('裸钻成本')) or 0
-                c['飞书配石成本'] = _client.get_number(fields.get('配石成本')) or 0
+                # v14.5: 保留 None 区别 (不再 or 0), 否则裸钻=0 初始化逻辑永远不触发
+                c['飞书裸钻成本'] = _client.get_number(fields.get('裸钻成本'))
+                c['飞书配石成本'] = _client.get_number(fields.get('配石成本'))
                 c['飞书主石'] = _client.get_text(fields.get('主石'))
                 c['飞书圈号'] = _client.get_text(fields.get('圈号'))
                 c['飞书利润'] = _client.get_number(fields.get('利润'))
