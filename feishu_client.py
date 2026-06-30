@@ -107,21 +107,29 @@ class FeishuClient:
 
     @staticmethod
     def get_number(v):
-        """从飞书字段值里提取数字, 失败返回 None"""
-        if v is None:
+        """从飞书字段值里提取数字, 失败返回 None
+        v14.4: 支持嵌套 list / dict (公式字段返回 [{type:'number', text:'1393', value:1393}])
+        """
+        if v is None or isinstance(v, bool):
             return None
         if isinstance(v, (int, float)):
             return v
         if isinstance(v, str):
             try:
-                return float(v)
+                return float(v.replace(',', '').replace('¥', '').strip())
             except ValueError:
                 return None
-        if isinstance(v, dict) and 'value' in v:
-            try:
-                return float(v['value'])
-            except (TypeError, ValueError):
-                return None
+        if isinstance(v, list) and v:
+            return FeishuClient.get_number(v[0])
+        if isinstance(v, dict):
+            # 飞书公式字段常见结构: {value: [...], type: 'Formula'}
+            #                   或 {value: 1393, type: 'Number'}
+            #                   或 {text: '1393', value: 1393}
+            for key in ('value', 'number', 'text', 'name'):
+                if key in v:
+                    n = FeishuClient.get_number(v[key])
+                    if n is not None:
+                        return n
         return None
 
     # ============ 查询 ============
