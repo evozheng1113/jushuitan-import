@@ -48,17 +48,10 @@ uploaded = st.file_uploader(
     help="支持: 雅希(广州) / 倾诚(二厂) / 黛宝(三厂) / 猛哥(四厂)"
 )
 
-col1, col2 = st.columns(2)
-with col1:
-    factory_label = st.selectbox(
-        "工厂",
-        ["自动识别", "A 雅希 (广州)", "B 倾诚 (二厂)", "D 黛宝 (三厂)", "E 猛哥 (四厂)"],
-    )
-with col2:
-    is_natural = st.checkbox(
-        "天然钻石", value=False,
-        help="勾选后聚水潭「主石类别」='天然钻石', 商品名加'天然'前缀"
-    )
+factory_label = st.selectbox(
+    "工厂",
+    ["自动识别", "A 雅希 (广州)", "B 倾诚 (二厂)", "D 黛宝 (三厂)", "E 猛哥 (四厂)"],
+)
 
 col3, col4 = st.columns(2)
 with col3:
@@ -66,29 +59,43 @@ with col3:
 with col4:
     au = st.number_input("黄金价 18K (元/g)", value=900.0, step=1.0, format="%.2f")
 
-include_spots = st.checkbox("包含现货件", value=True)
-use_feishu = st.checkbox("查飞书补客户名/利润/圈号/主石", value=feishu_ready,
-                         disabled=not feishu_ready)
-
-# v12: 同步飞书镶嵌成本
-sync_feishu = st.checkbox(
-    "✏️ 同步今日成本到飞书 (写入「镶嵌成本」字段)",
-    value=False,
+# 永远包含现货件 (v13 移除选项)
+include_spots = True
+# 查飞书: 飞书连通就默认勾上
+use_feishu = st.checkbox(
+    "查飞书补客户名/利润/圈号/主石",
+    value=feishu_ready,
     disabled=not feishu_ready,
-    help="勾选后会把工厂账单算出的成本写回飞书表; "
-         "已有成本默认叠加 (累加), 想覆盖请勾下方选项",
 )
+
+st.divider()
+st.markdown("**🎯 任务**（至少选一项）:")
+
+# v13: 两个独立任务
+col_a, col_b = st.columns(2)
+with col_a:
+    do_jst = st.checkbox(
+        "📦 生成聚水潭入库 Excel",
+        value=True,
+    )
+with col_b:
+    sync_feishu = st.checkbox(
+        "✏️ 同步今日成本到飞书",
+        value=False,
+        disabled=not feishu_ready,
+        help="勾上后写入飞书「镶嵌成本」字段",
+    )
+
 overwrite = False
 if sync_feishu:
     st.warning(
-        "⚠️ **写入模式**: 会修改飞书表的「镶嵌成本」字段。"
-        "默认叠加 (累加到原值), 已退款件自动写 0。"
-        "**确认这是今天的最新工厂账单**再点生成。"
+        "⚠️ **将写入飞书**: 修改「镶嵌成本」字段。"
+        "默认叠加 (原值+今天值), 已退款件自动写 0。"
+        "**确认这是今天的最新账单**再生成。"
     )
     overwrite = st.checkbox(
         "覆盖模式 (飞书已有成本时直接覆盖, 不叠加)",
         value=False,
-        help="默认叠加: 飞书原值 + 今天值; 覆盖: 直接替换成今天值",
     )
 
 
@@ -121,14 +128,25 @@ def detect_is_natural(filename):
     return '天然钻石' in name or '天然钻' in name
 
 
-if uploaded is not None and detect_is_natural(uploaded.name) and not is_natural:
-    is_natural = True
-    st.info(f"📂 文件名含「天然钻石」→ 已自动勾选「天然钻石」选项")
+# v13: 天然钻石按文件名自动识别 (猛哥单子文件名都会写)
+is_natural = False
+if uploaded is not None:
+    is_natural = detect_is_natural(uploaded.name)
+    if is_natural:
+        st.info("💎 文件名含「天然钻石」→ 主石类别会写'天然钻石', 商品名加'天然'前缀")
 
 # ---------------- 主流程 ----------------
-if st.button("🚀 生成聚水潭入库 Excel",
-             disabled=uploaded is None,
-             type="primary"):
+# 必须勾至少一项任务才能点
+can_run = uploaded is not None and (do_jst or sync_feishu)
+btn_label = "🚀 开始"
+if do_jst and sync_feishu:
+    btn_label = "🚀 生成入库 Excel + 同步飞书"
+elif do_jst:
+    btn_label = "🚀 生成聚水潭入库 Excel"
+elif sync_feishu:
+    btn_label = "🚀 同步成本到飞书"
+
+if st.button(btn_label, disabled=not can_run, type="primary"):
     try:
         suffix = '.xlsx'
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
@@ -278,63 +296,66 @@ if st.button("🚀 生成聚水潭入库 Excel",
                         for no, why in write_fails:
                             st.text(f"  #{no}: {why}")
 
-        # 构造入库行
-        targets = list(clients)
-        if include_spots:
-            targets += spots
-        if not targets:
-            st.warning("⚠️ 没有可入库的件")
-            os.unlink(in_path)
-            st.stop()
+        # ============== v13: 生成入库 Excel (只在勾选时) ==============
+        if do_jst:
+            st.subheader("📦 生成聚水潭入库 Excel")
+            targets = list(clients) + list(spots)   # v13: 永远含现货件
+            if not targets:
+                st.warning("⚠️ 没有可入库的件 (客户单/现货都为 0)")
+            else:
+                rows = []
+                for it in targets:
+                    row = jst.build_row_from_item(
+                        item=it,
+                        factory_code=code,
+                        feishu_cert=it.get('飞书证书编码') or it.get('证书编号'),
+                        feishu_luozuan=it.get('飞书裸钻成本') or 0,
+                        feishu_peishi=it.get('飞书配石成本') or 0,
+                        feishu_main_stone=it.get('飞书主石'),
+                        feishu_ring_size=it.get('飞书圈号'),
+                        total_weight=it.get('总重'),
+                        is_natural=is_natural,
+                    )
+                    rows.append(row)
 
-        rows = []
-        for it in targets:
-            row = jst.build_row_from_item(
-                item=it,
-                factory_code=code,
-                feishu_cert=it.get('飞书证书编码') or it.get('证书编号'),
-                feishu_luozuan=it.get('飞书裸钻成本') or 0,
-                feishu_peishi=it.get('飞书配石成本') or 0,
-                feishu_main_stone=it.get('飞书主石'),
-                feishu_ring_size=it.get('飞书圈号'),
-                total_weight=it.get('总重'),
-                is_natural=is_natural,
-            )
-            rows.append(row)
+                out_path = tempfile.mktemp(suffix='.xlsx')
+                added, _ = jst.generate_or_append(out_path, rows)
 
-        out_path = tempfile.mktemp(suffix='.xlsx')
-        added, _ = jst.generate_or_append(out_path, rows)
+                st.success(f"✅ 已生成 {added} 行")
 
-        st.success(f"✅ 已生成 {added} 行")
+                with st.expander("📋 预览前 8 行"):
+                    preview = []
+                    for r in rows[:8]:
+                        preview.append({
+                            '商品编码': r.get('商品编码'),
+                            '商品名': r.get('商品名称'),
+                            '成色': r.get('成色'),
+                            '主石类别': r.get('主石类别'),
+                            '主石ct': r.get('主石重量'),
+                            '颜色': r.get('颜色等级'),
+                            '净度': r.get('净度'),
+                            '圈号': r.get('指圈号'),
+                            '总重': r.get('总重'),
+                            '成本': r.get('成本价'),
+                        })
+                    st.dataframe(preview, use_container_width=True, hide_index=True)
 
-        with st.expander("📋 预览前 8 行"):
-            preview = []
-            for r in rows[:8]:
-                preview.append({
-                    '商品编码': r.get('商品编码'),
-                    '商品名': r.get('商品名称'),
-                    '成色': r.get('成色'),
-                    '主石类别': r.get('主石类别'),
-                    '主石ct': r.get('主石重量'),
-                    '颜色': r.get('颜色等级'),
-                    '净度': r.get('净度'),
-                    '圈号': r.get('指圈号'),
-                    '总重': r.get('总重'),
-                    '成本': r.get('成本价'),
-                })
-            st.dataframe(preview, use_container_width=True, hide_index=True)
+                with open(out_path, 'rb') as f:
+                    data = f.read()
+                fname = f'聚水潭入库_{code}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
+                st.download_button(
+                    "📥 下载聚水潭入库 Excel", data=data, file_name=fname,
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    type="primary",
+                )
 
-        with open(out_path, 'rb') as f:
-            data = f.read()
-        fname = f'聚水潭入库_{code}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
-        st.download_button(
-            "📥 下载聚水潭入库 Excel", data=data, file_name=fname,
-            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            type="primary",
-        )
+                try:
+                    os.unlink(out_path)
+                except OSError:
+                    pass
 
         try:
-            os.unlink(in_path); os.unlink(out_path)
+            os.unlink(in_path)
         except OSError:
             pass
 
