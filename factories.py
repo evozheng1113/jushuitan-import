@@ -639,6 +639,11 @@ def parse_E(excel_path, pt_price, au_price, sheet_name=None, default_material=No
     for r in range(6, ws.max_row + 1):
         a = ws.cell(row=r, column=COL['序号']).value
         b = ws.cell(row=r, column=COL['单号']).value
+        # v15.4: 天然钻石模板下单单号写在"编码"列, "单号"列空 → 用编码列兜底
+        if not b and COL.get('编码') and COL['编码'] != COL['单号']:
+            code_val = ws.cell(row=r, column=COL['编码']).value
+            if code_val:
+                b = code_val
         b_str = str(b or '').strip()
         c_cell = ws.cell(row=r, column=COL['品名']).value
         d_cell = ws.cell(row=r, column=COL['成色']).value
