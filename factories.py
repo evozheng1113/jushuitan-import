@@ -608,11 +608,20 @@ def _detect_E_columns(ws):
         found['总重量'] = found['件数'] + 1
     if '主石' in found:
         found['主石重量'] = found['主石'] + 1
-        found['主石金额'] = found['主石'] + 4
+        # v15.5: 主石金额位置 — 若有副石表头, 用副石-1 (最后一列); 否则 hardcode +4
+        if '副石' in found and found['副石'] > found['主石']:
+            found['主石金额'] = found['副石'] - 1
+        else:
+            found['主石金额'] = found['主石'] + 4
     if '副石' in found:
         found['副石重量'] = found['副石'] + 1
-        found['副石金额'] = found['副石'] + 4
-        found['镶石费'] = found['副石'] + 5
+        # 副石金额位置: 有镶主石费的话, 副石金额 = 镶主石费 - 1
+        if '镶主石费' in found and found['镶主石费'] > found['副石']:
+            found['副石金额'] = found['镶主石费'] - 2   # 副石金额 / 镶石费 / 镶主石费
+            found['镶石费'] = found['镶主石费'] - 1
+        else:
+            found['副石金额'] = found['副石'] + 4
+            found['镶石费'] = found['副石'] + 5
     if '工艺费' in found:
         found['版蜡'] = found['工艺费'] - 1
     defaults = {
@@ -765,7 +774,18 @@ def parse_E(excel_path, pt_price, au_price, sheet_name=None, default_material=No
                       '_E_COL': COL,
                       '飞书匹配键': fly_key, '飞书客户名': customer,
                       '_sheet_idx': sheet_idx, '_sheet_title': ws.title})
-    return items
+
+    # v15.5: 合并连续同单号+同品名的行 (一对耳钉工厂占两行, 业务上算 1 件)
+    merged = []
+    for it in items:
+        if (merged and it['类别'] == '客户单' and merged[-1]['类别'] == '客户单'
+                and it.get('飞书匹配键') and it.get('飞书匹配键') == merged[-1].get('飞书匹配键')
+                and it.get('品名') == merged[-1].get('品名')):
+            # 合并到前一个 item: 保留成本(相同) + rows 追加
+            merged[-1]['rows'].extend(it['rows'])
+        else:
+            merged.append(it)
+    return merged
 
 
 def write_E(excel_path, items, out_path):
@@ -779,38 +799,38 @@ def write_E(excel_path, items, out_path):
     profit_col = af_col + 2
     rate_col = af_col + 3
     for it in items:
-        r = it['rows'][0]
         is_silver = it.get('_is_silver')
+        # v15.5: 遍历所有 rows (合并后的多行件, 每行都要填)
+        for r in it['rows']:
+            if not is_silver and not it.get('_factory_K_filled') and it.get('折足金'):
+                modifications[(r, COL.get('折足金', 11))] = it['折足金']
+            if not is_silver and not it.get('_factory_L_filled') and it.get('金价'):
+                modifications[(r, COL.get('金价', 12))] = it['金价']
+            if not is_silver and not it.get('_factory_M_filled') and it.get('金值'):
+                k_letter = _col_letter(COL.get('折足金', 11))
+                l_letter = _col_letter(COL.get('金价', 12))
+                modifications[(r, COL.get('金值', 13))] = (f'={k_letter}{r}*{l_letter}{r}', it['金值'])
+            if it.get('镶嵌成本'):
+                modifications[(r, af_col)] = it['镶嵌成本']
 
-        if not is_silver and not it.get('_factory_K_filled') and it.get('折足金'):
-            modifications[(r, COL.get('折足金', 11))] = it['折足金']
-        if not is_silver and not it.get('_factory_L_filled') and it.get('金价'):
-            modifications[(r, COL.get('金价', 12))] = it['金价']
-        if not is_silver and not it.get('_factory_M_filled') and it.get('金值'):
-            k_letter = _col_letter(COL.get('折足金', 11))
-            l_letter = _col_letter(COL.get('金价', 12))
-            modifications[(r, COL.get('金值', 13))] = (f'={k_letter}{r}*{l_letter}{r}', it['金值'])
-        if it.get('镶嵌成本'):
-            modifications[(r, af_col)] = it['镶嵌成本']
+            customer = it.get('飞书客户名')
+            if not customer:
+                if it['类别'] == '客户单':
+                    customer = '[待填]'
+                elif it['类别'] == '现货':
+                    customer = '现货'
+                elif it['类别'] == '部门-真诚':
+                    customer = '真诚'
+            if customer:
+                modifications[(r, name_col)] = customer
 
-        customer = it.get('飞书客户名')
-        if not customer:
             if it['类别'] == '客户单':
-                customer = '[待填]'
-            elif it['类别'] == '现货':
-                customer = '现货'
-            elif it['类别'] == '部门-真诚':
-                customer = '真诚'
-        if customer:
-            modifications[(r, name_col)] = customer
-
-        if it['类别'] == '客户单':
-            profit = it.get('飞书利润')
-            if isinstance(profit, (int, float)):
-                modifications[(r, profit_col)] = _profit(profit)
-            rate = _fmt_profit_rate(it.get('飞书利润率'))
-            if rate is not None:
-                modifications[(r, rate_col)] = _profit(rate)
+                profit = it.get('飞书利润')
+                if isinstance(profit, (int, float)):
+                    modifications[(r, profit_col)] = _profit(profit)
+                rate = _fmt_profit_rate(it.get('飞书利润率'))
+                if rate is not None:
+                    modifications[(r, rate_col)] = _profit(rate)
     _patch_xlsx_cells(excel_path, out_path, modifications,
                       sheet_name='sheet1', sheet_title=sheet_title)
 
