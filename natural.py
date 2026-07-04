@@ -46,6 +46,25 @@ def _norm_code(cert):
     return f"{s}-1"
 
 
+def _current_year_gia_sheets(sheets, year=None, month=None):
+    """只保留 sheet 名结尾是"目标年份"的.
+       规则:
+       - 默认只跑当年 (title 后缀 '26' → 2026)
+       - 但当前月份 <= 3 (Q1 过渡期), 也把去年一并跑 (客户单可能是去年配的石头)
+         例: 2027 年 3 月 → 跑 title 后缀 '27' 和 '26' 的所有 sheet
+       - 兜底: 如果一个都没匹配上, 返回全部 (防止年份识别失效)
+    """
+    now = datetime.now()
+    year = year if year is not None else now.year
+    month = month if month is not None else now.month
+    include = {str(year)[-2:]}
+    if month <= 3:
+        include.add(str(year - 1)[-2:])
+    hits = [s for s in sheets
+            if any(s.get('title', '').rstrip().endswith(y) for y in include)]
+    return hits if hits else sheets
+
+
 def _sort_gia_sheets(sheets, months=2):
     """GIA 订货 sheet 按 (年, 月) 元组倒排, 取最近 N 个 (0=全部).
        sheet 名格式:

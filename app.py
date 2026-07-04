@@ -246,9 +246,10 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
         gia_client = get_gia_client()
         all_sheets = gia_client.list_sheets(natural.GIA_TOKEN)
         order_sheets_all = [s for s in all_sheets if '订货' in s.get('title', '')]
-        order_sheets = natural._sort_gia_sheets(order_sheets_all, gia_months)
-        st.caption(f"总共 {len(order_sheets_all)} 个订货 sheet, 只查 "
-                   f"{'全部' if gia_months == 0 else f'最近 {gia_months} 个'}: "
+        # v19.5: 只查当年 sheet (title 以 "26" 结尾 = 2026 年)
+        order_sheets = natural._current_year_gia_sheets(order_sheets_all)
+        st.caption(f"总共 {len(order_sheets_all)} 个订货 sheet, "
+                   f"只查当年 ({datetime.now().year}) → {len(order_sheets)} 个: "
                    + ' / '.join(s.get('title', '') for s in order_sheets))
     except Exception as e:
         st.error(f"❌ GIA 库存查询初始化失败: {e}")
