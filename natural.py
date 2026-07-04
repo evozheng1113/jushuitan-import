@@ -148,20 +148,20 @@ def _parse_layout(header):
         if v is None or v == '': continue
         s = str(v).strip()
         if s == '商品名称': layout['商品名称'] = i
-        elif s == '销售': layout['销售'] = i
-        elif s == '客户': layout['客户'] = i
+        elif s in ('销售', '业务', '业务员', '销售员'): layout['销售'] = i
+        elif s in ('客户', '客户名', '客户名称', '姓名'): layout['客户'] = i
         elif s == '证书': layout['证书'] = i
-        elif s == '证书编号': layout['证书编号'] = i
+        elif s in ('证书编号', '证书号', 'GIA号', 'GIA编号'): layout['证书编号'] = i
         elif s == '商品编码': layout['商品编码'] = i
         elif s == '成本': layout['成本'] = i
         elif s in ('人民币', '含税人民币约', '人民币约'): layout['人民币'] = i
         elif s == '形状': layout['形状'] = i
-        elif s in ('主石重量', '克拉'): layout['克拉'] = i
+        elif s in ('主石重量', '克拉', '重量', '重量ct', '重量(ct)'): layout['克拉'] = i
         elif s in ('颜色等级', '颜色'): layout['颜色'] = i
         elif s == '净度': layout['净度'] = i
         elif s == '切工': layout['切工'] = i
         elif s == '抛光': layout['抛光'] = i
-        elif s == '对称性': layout['对称性'] = i
+        elif s in ('对称性', '对称'): layout['对称性'] = i
         elif s == '荧光': layout['荧光'] = i
     return layout
 

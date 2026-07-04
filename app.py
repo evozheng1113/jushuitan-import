@@ -95,6 +95,9 @@ with col3:
 with col4:
     au = st.number_input("黄金价", value=900.0, step=1.0, format="%.2f")
 
+# 天然钻查飞书 GIA 库存的窗口: 0 = 查全部 sheet (慢一些但稳, 客户几个月前配的老石头也能捞到)
+GIA_MONTHS = 0
+
 # v15: 对齐终端 process.py
 # - 工厂单 _完成.xlsx 永远生成 (基础产物)
 # - 有客户单 + 飞书连通 → 自动查飞书 (要写入完成文件的客户名 / 利润)
@@ -211,7 +214,7 @@ def get_gia_client():
 
 
 # ---------------- 天然钻流程 (共用: 黛宝 / 布心 / 猛哥 / 二厂) ----------------
-def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_months=2):
+def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_months=6):
     """
     跑一次天然钻流程: 解析 → 查 GIA → 生成聚水潭 xlsx + 下载按钮.
     factory_name: natural.PARSERS 的键 ('黛宝'/'布心'/'猛哥'/'二厂')
@@ -244,11 +247,25 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
         all_sheets = gia_client.list_sheets(natural.GIA_TOKEN)
         order_sheets_all = [s for s in all_sheets if '订货' in s.get('title', '')]
         order_sheets = natural._sort_gia_sheets(order_sheets_all, gia_months)
-        st.caption(f"总共 {len(order_sheets_all)} 个订货 sheet, 只查最近 "
-                   f"{gia_months} 个: " + ' / '.join(s.get('title', '') for s in order_sheets))
+        st.caption(f"总共 {len(order_sheets_all)} 个订货 sheet, 只查 "
+                   f"{'全部' if gia_months == 0 else f'最近 {gia_months} 个'}: "
+                   + ' / '.join(s.get('title', '') for s in order_sheets))
     except Exception as e:
         st.error(f"❌ GIA 库存查询初始化失败: {e}")
         return 0
+
+    # v19.4: 预加载所有 sheet 的 layout, 让用户看到每 sheet 表头识别到了哪些字段
+    with st.expander("🔬 各 sheet 表头识别 (点开看诊断)", expanded=False):
+        layout_lines = []
+        for sh in order_sheets:
+            title = sh.get('title', '')
+            try:
+                rows, layout = natural._load_gia_sheet(gia_client, sh.get('sheet_id'))
+                keys_str = ', '.join(sorted(layout.keys())) if layout else '(空 — 表头未识别)'
+                layout_lines.append(f"[{title}] 行数={len(rows)} 识别字段: {keys_str}")
+            except Exception as e:
+                layout_lines.append(f"[{title}] ❌ 拉取失败: {e}")
+        st.code('\n'.join(layout_lines), language=None)
 
     placeholder = st.empty()
     progress = st.progress(0.0)
@@ -258,9 +275,11 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
         it['_gia'] = gia
         attrs = gia.get('attrs') or {}
         red_mark = ' 🔴多散货' if gia['散货行数'] >= 2 else ''
+        hit_mark = '✓' if attrs.get('证书') else '✗'
         lines.append(
-            f"  #{it['no']} {it['款号']} → 成本1={gia['cost1']:.0f} "
-            f"成本2={gia['cost2']:.0f} (散货{gia['散货行数']}条){red_mark}"
+            f"  {hit_mark} #{it['no']} {it['款号']} (证书号={it['证书号'] or '空'}) → "
+            f"成本1={gia['cost1']:.0f} 成本2={gia['cost2']:.0f} "
+            f"(散货{gia['散货行数']}条){red_mark}"
         )
         if attrs.get('证书'):
             lines.append(
@@ -268,6 +287,9 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
                 f"{attrs.get('主石重量','')}ct {attrs.get('颜色等级','')} "
                 f"{attrs.get('净度','')}"
             )
+        # v19.4: 未匹配上的 → 打印 debug 详情帮定位
+        if not attrs.get('证书'):
+            lines.append(f"      🔍 {gia.get('debug', '(无 debug)')[:300]}")
         placeholder.code('\n'.join(lines), language=None)
         progress.progress((i + 1) / len(items))
     progress.empty()
@@ -355,7 +377,8 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                 try: os.unlink(in_path)
                 except OSError: pass
                 st.stop()
-            run_natural_workflow(in_path, uploaded.name, natural_factory, pt, au)
+            run_natural_workflow(in_path, uploaded.name, natural_factory, pt, au,
+                                 gia_months=GIA_MONTHS)
             try: os.unlink(in_path)
             except OSError: pass
             st.stop()
@@ -639,7 +662,8 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
             st.divider()
             st.subheader("💎💎 猛哥双份 — 追加天然钻流程 (19楼真诚部门)")
             try:
-                run_natural_workflow(in_path, uploaded.name, '猛哥', pt, au)
+                run_natural_workflow(in_path, uploaded.name, '猛哥', pt, au,
+                                     gia_months=GIA_MONTHS)
             except Exception as e:
                 st.error(f"❌ 天然钻流程失败: {e}")
                 with st.expander("详细错误"):
