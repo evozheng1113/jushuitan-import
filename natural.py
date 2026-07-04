@@ -47,16 +47,39 @@ def _norm_code(cert):
 
 
 def _sort_gia_sheets(sheets, months=2):
-    """GIA 订货 sheet 按名字里的数字倒排, 取最近 N 个 (0=全部)."""
+    """GIA 订货 sheet 按 (年, 月) 元组倒排, 取最近 N 个 (0=全部).
+       sheet 名格式:
+         '4月订货26'  → 年=2026, 月=4
+         '12月订货25' → 年=2025, 月=12
+         '6月订货'    → 年=None (无年份, 排最后)
+       修复: 旧版数字拼接 "1225" > "426" 导致 12月25 被误认为最新.
+    """
     if months <= 0:
         return sheets
-    def key(sh):
+
+    def key(sh_with_idx):
+        idx, sh = sh_with_idx
         title = sh.get('title', '')
-        nums = re.findall(r'\d+', title)
-        if not nums: return 0
-        try: return int(''.join(nums))
-        except ValueError: return 0
-    return sorted(sheets, key=key, reverse=True)[:months]
+        # M月订货YY 或 M月订货YYYY
+        m = re.match(r'^\s*(\d{1,2})月订货\s*(\d{0,4})\s*$', title)
+        if m:
+            month = int(m.group(1))
+            year_s = m.group(2)
+            if year_s:
+                year = int(year_s)
+                # 两位年份补 2000 (25→2025, 5→2005)
+                if year < 100:
+                    year = 2000 + year
+                return (1, year, month)  # 有年月, 排最前
+            else:
+                # 只有月份 (如 "6月订货") = 更老的历史, 排最后
+                return (0, 0, month)
+        # 完全解析不了的 → 按 sheet 顺序 (idx 越小越靠前)
+        return (-1, 0, -idx)
+
+    indexed = list(enumerate(sheets))
+    sorted_ = sorted(indexed, key=key, reverse=True)
+    return [sh for _, sh in sorted_[:months]]
 
 
 def ensure_xlsx(path):
@@ -441,6 +464,11 @@ def parse_buxin(xlsx_path, au_price, pt_price):
             weight  = ws.cell(row=r, column=9).value
             l_val   = _num(ws.cell(row=r, column=12).value)
             am_val  = _num(ws.cell(row=r, column=39).value)
+            # v19.3: 副石列位 (布心)
+            #   副石1 组: U(21)数量  V(22)石重  W(23)单价  X(24)金额 ← 天然散货 (3200元/ct)
+            #   副石2 组: Y(25)数量  Z(26)石重  AA(27)单价 AB(28)金额 ← 培育散货 (1120元/ct)
+            side1_amt = _num(ws.cell(row=r, column=24).value)  # X 副石1金额
+            side2_amt = _num(ws.cell(row=r, column=28).value)  # AB 副石2金额
             if l_val <= 0: continue  # 跳过退货
             if not str(kuanhao or '').strip(): continue
             cost_mount = round(l_val * ratio * gp + am_val)
@@ -457,6 +485,8 @@ def parse_buxin(xlsx_path, au_price, pt_price):
                 '总重': weight,
                 '副石重量_合计': None,
                 '镶嵌成本': cost_mount,
+                '_副石1金额': side1_amt,
+                '_副石2金额': side2_amt,
                 '_sheet': sname,
             })
     return items
@@ -660,16 +690,47 @@ JST_COLS = [
 RED_FILL = PatternFill(start_color='FFCCCC', end_color='FFCCCC', fill_type='solid')
 
 
+def _classify_stone(cert_no, attrs, item=None):
+    """按证书类型/副石位置决定分类, 优先级从高到低:
+       1. 工厂单证书号 LG 开头 → 培育钻石 (LG = Lab Grown)
+       2. GIA 主石行证书列 = IGI → 培育钻石
+       3. GIA 主石行证书列 = GIA (或其他非 IGI 值) → 天然钻石
+       4. 没有主石行 (全散货 / 无匹配): 看工厂单副石列位
+          - 副石2 金额 > 0 → 培育钻石 (布心副石2 = 培育散货, 单价 ~1120)
+          - 副石1 金额 > 0 → 天然钻石 (布心副石1 = 天然散货, 单价 ~3200)
+       5. 兜底 → 天然钻石 (真诚部门业务默认)
+    """
+    cert_no_up = str(cert_no or '').strip().upper()
+    if cert_no_up.startswith('LG'):
+        return '培育钻石'
+    zheng = str((attrs or {}).get('证书') or '').strip().upper()
+    if 'IGI' in zheng:
+        return '培育钻石'
+    if 'GIA' in zheng:
+        return '天然钻石'
+    # 没主石行 (可能只散货或飞书完全没匹配), 看工厂单副石1/副石2 谁有金额
+    if item:
+        s1 = item.get('_副石1金额') or 0
+        s2 = item.get('_副石2金额') or 0
+        if s2 > 0 and s2 >= s1:
+            return '培育钻石'
+        if s1 > 0:
+            return '天然钻石'
+    # 兜底
+    return '天然钻石'
+
+
 def build_jst_row(it, gia, factory_name):
     attrs = gia.get('attrs') or {}
     cost1 = gia.get('cost1') or 0
     cost2 = gia.get('cost2') or 0
     cost3 = it.get('镶嵌成本') or 0
     total = cost1 + cost2 + cost3
+    category = _classify_stone(it.get('证书号'), attrs, it)
     return {
         '商品名称': it['款号'],
         '证书': attrs.get('证书'),
-        '分类': '天然钻石',
+        '分类': category,
         '形状': attrs.get('形状'),
         '主石重量': attrs.get('主石重量'),
         '颜色等级': attrs.get('颜色等级'),
