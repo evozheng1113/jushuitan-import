@@ -9,7 +9,17 @@ from datetime import datetime
 
 import factories
 import jushuitan_import as jst
+import natural  # 天然钻 (v19)
 from feishu_client import FeishuClient, APP_TOKEN, TABLE_ID, load_credentials
+
+# 培育钻 code(A/B/D/E) → natural.py 里对应的天然钻工厂名
+NATURAL_FACTORY_MAP = {
+    'B': '二厂',   # 二厂真诚
+    'D': '黛宝',
+    'E': '猛哥',
+    # A(雅希) 暂无天然钻流程 (待需求)
+}
+NATURAL_FACTORY_MAP_BUXIN = '布心'  # 布心走独立文件, 靠文件名单独识别
 
 
 st.set_page_config(page_title="聚水潭入库生成", page_icon="💎", layout="centered")
@@ -135,8 +145,10 @@ if sync_feishu:
 FACTORY_HINTS = [
     ('郑国远', 'A'), ('雅希', 'A'), ('广州', 'A'),
     ('倾城', 'B'), ('倾诚', 'B'), ('JC', 'B'),
+    ('真诚出货单', 'B'),   # 二厂 天然钻单 (真诚部门, 文件名唯一识别)
     ('郑总', 'E'), ('天然钻石', 'E'),
     ('008-', 'D'), ('SG2026', 'D'), ('-SG', 'D'), ('黛宝', 'D'),
+    ('ZC', 'BUXIN'),        # 布心 (培育 ZC2026年出货 / 天然 ZC26年出货, 靠内容分辨天然/培育)
 ]
 
 
@@ -156,8 +168,141 @@ def detect_default_material(filename):
 
 
 def detect_is_natural(filename):
+    """文件名识别天然钻工厂单:
+       - 猛哥: '天然钻石' / '天然钻'
+       - 二厂: '真诚出货单'
+       黛宝 / 布心的文件名跟培育版几乎一样, 用 detect_is_natural_by_content 内容识别兜底.
+    """
     name = os.path.basename(filename)
-    return '天然钻石' in name or '天然钻' in name
+    return ('天然钻石' in name or '天然钻' in name
+            or '真诚出货单' in name)
+
+
+def detect_is_natural_by_content(xlsx_path):
+    """打开 xlsx 看 sheet 名, 有 '结料' / '真诚' 字样 → 天然钻单.
+       布心天然 sheet 名 = 'PT出货单 结料 7-4' (培育没'结料'),
+       黛宝天然 sheet 名可能含 '真诚' (待用户确认).
+    """
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(xlsx_path, data_only=True, read_only=True)
+        for sn in wb.sheetnames:
+            if '结料' in sn or '真诚' in sn:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def detect_natural_factory_name(code, filename):
+    """把 A/B/D/E code 映射到 natural.PARSERS 里的工厂名.
+       code 可能是 'BUXIN' (布心走文件名映射), 或 'B'/'D'/'E' (走 NATURAL_FACTORY_MAP).
+    """
+    if code == 'BUXIN':
+        return '布心'
+    return NATURAL_FACTORY_MAP.get(code)
+
+
+# ---------------- 飞书 GIA 电子表格 客户端 (只做天然钻查询) ----------------
+@st.cache_resource
+def get_gia_client():
+    app_id, app_secret = load_credentials()
+    return natural.FeishuSheetClient(app_id, app_secret)
+
+
+# ---------------- 天然钻流程 (共用: 黛宝 / 布心 / 猛哥 / 二厂) ----------------
+def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_months=2):
+    """
+    跑一次天然钻流程: 解析 → 查 GIA → 生成聚水潭 xlsx + 下载按钮.
+    factory_name: natural.PARSERS 的键 ('黛宝'/'布心'/'猛哥'/'二厂')
+    """
+    st.subheader(f"💎 天然钻流程 — {factory_name}")
+    parser = natural.PARSERS[factory_name]
+    with st.spinner(f"解析 {factory_name} 天然钻单..."):
+        try:
+            items = parser(in_path, au_price=au, pt_price=pt)
+        except Exception as e:
+            st.error(f"❌ 解析失败: {e}")
+            with st.expander("详细错误"):
+                st.code(traceback.format_exc())
+            return 0
+
+    st.info(f"识别到 **{len(items)}** 件天然钻客订")
+    if not items:
+        st.warning("⚠️ 没有天然钻客订件, 天然聚水潭跳过")
+        return 0
+
+    with st.expander(f"📋 {len(items)} 件客订清单"):
+        for it in items:
+            st.text(f"  #{it['no']} 客户={it['款号']} 品名={it['品名']} "
+                    f"成色={it['材质颜色']} 镶嵌成本={it['镶嵌成本']}")
+
+    # 查 GIA 库存
+    st.markdown("**🔍 查飞书 GIA 库存**")
+    try:
+        gia_client = get_gia_client()
+        all_sheets = gia_client.list_sheets(natural.GIA_TOKEN)
+        order_sheets_all = [s for s in all_sheets if '订货' in s.get('title', '')]
+        order_sheets = natural._sort_gia_sheets(order_sheets_all, gia_months)
+        st.caption(f"总共 {len(order_sheets_all)} 个订货 sheet, 只查最近 "
+                   f"{gia_months} 个: " + ' / '.join(s.get('title', '') for s in order_sheets))
+    except Exception as e:
+        st.error(f"❌ GIA 库存查询初始化失败: {e}")
+        return 0
+
+    placeholder = st.empty()
+    progress = st.progress(0.0)
+    lines = []
+    for i, it in enumerate(items):
+        gia = natural.search_gia(gia_client, order_sheets, it['款号'], it['证书号'])
+        it['_gia'] = gia
+        attrs = gia.get('attrs') or {}
+        red_mark = ' 🔴多散货' if gia['散货行数'] >= 2 else ''
+        lines.append(
+            f"  #{it['no']} {it['款号']} → 成本1={gia['cost1']:.0f} "
+            f"成本2={gia['cost2']:.0f} (散货{gia['散货行数']}条){red_mark}"
+        )
+        if attrs.get('证书'):
+            lines.append(
+                f"      属性: {attrs.get('证书','')} {attrs.get('形状','')} "
+                f"{attrs.get('主石重量','')}ct {attrs.get('颜色等级','')} "
+                f"{attrs.get('净度','')}"
+            )
+        placeholder.code('\n'.join(lines), language=None)
+        progress.progress((i + 1) / len(items))
+    progress.empty()
+
+    # 生成 xlsx
+    jst_rows = [natural.build_jst_row(it, it['_gia'], factory_name) for it in items]
+    out_path = tempfile.mktemp(suffix='.xlsx')
+    date_str = datetime.now().strftime('%m-%d')
+    natural.gen_jst_xlsx(jst_rows, out_path, sheet_title=f'{factory_name}天然{date_str}')
+    with open(out_path, 'rb') as f:
+        data = f.read()
+    try: os.unlink(out_path)
+    except OSError: pass
+
+    red_count = sum(1 for r in jst_rows if r.get('_红底'))
+    if red_count:
+        st.warning(f"⚠️ {red_count} 件多散货, 客户名已标红 — 请人工核验")
+
+    fname = f'聚水潭_{factory_name}天然_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
+    st.download_button(
+        f"📥 下载 {factory_name} 天然钻聚水潭 ({len(items)} 件)",
+        data=data, file_name=fname,
+        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        type="primary",
+        key=f'dl_nat_{factory_name}_{datetime.now().timestamp()}',
+    )
+    st.session_state.setdefault('history', []).append({
+        '时间': datetime.now().strftime('%H:%M:%S'),
+        '类型': f'聚水潭-{factory_name}天然',
+        '工厂': factory_name,
+        '件数': len(items),
+        '文件名': fname,
+        '_data': data,
+    })
+    return len(items)
 
 
 # v13: 天然钻石按文件名自动识别 (猛哥单子文件名都会写)
@@ -186,9 +331,34 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
         else:
             code = factory_label[0]
 
+        # v19: 天然钻兜底识别 (文件名兜不住的用内容 - sheet 名含"结料"/"真诚")
+        if not is_natural:
+            try:
+                if detect_is_natural_by_content(in_path):
+                    is_natural = True
+                    st.info("💎 检测到 sheet 名含「结料」/「真诚」→ 自动切换到天然钻流程")
+            except Exception:
+                pass
+        # BUXIN 是布心天然专用 code (培育钻网站没有布心工厂)
+        if code == 'BUXIN':
+            is_natural = True
+
         st.info(f"🏭 工厂: **{code}** | 铂 {pt} | 金 {au} | "
                 f"{'天然' if is_natural else '培育'}钻石 | "
                 f"{'查飞书' if use_feishu else '不查飞书'}")
+
+        # v19: 单纯天然钻工厂 (布心 / 黛宝 / 二厂) → 只跑天然流程, 跳过培育
+        if is_natural and code != 'E':
+            natural_factory = detect_natural_factory_name(code, uploaded.name)
+            if not natural_factory:
+                st.error(f"❌ 无法定位天然钻 parser (code={code}, 文件={uploaded.name})")
+                try: os.unlink(in_path)
+                except OSError: pass
+                st.stop()
+            run_natural_workflow(in_path, uploaded.name, natural_factory, pt, au)
+            try: os.unlink(in_path)
+            except OSError: pass
+            st.stop()
 
         default_material = detect_default_material(uploaded.name)
         parse_kwargs = dict(pt_price=pt, au_price=au)
@@ -463,6 +633,17 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
             st.error(f"生成工厂单完成文件失败: {e}")
             with st.expander("详细错误"):
                 st.code(traceback.format_exc())
+
+        # v19: 猛哥天然钻单同表混合 → 培育钻流程跑完后, 追加天然钻流程 (19楼)
+        if is_natural and code == 'E':
+            st.divider()
+            st.subheader("💎💎 猛哥双份 — 追加天然钻流程 (19楼真诚部门)")
+            try:
+                run_natural_workflow(in_path, uploaded.name, '猛哥', pt, au)
+            except Exception as e:
+                st.error(f"❌ 天然钻流程失败: {e}")
+                with st.expander("详细错误"):
+                    st.code(traceback.format_exc())
 
         try:
             os.unlink(in_path)
