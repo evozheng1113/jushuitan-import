@@ -182,15 +182,18 @@ def detect_is_natural(filename):
 
 
 def detect_is_natural_by_content(xlsx_path):
-    """打开 xlsx 看 sheet 名, 有 '结料' / '真诚' 字样 → 天然钻单.
-       布心天然 sheet 名 = 'PT出货单 结料 7-4' (培育没'结料'),
-       黛宝天然 sheet 名可能含 '真诚' (待用户确认).
+    """打开 xlsx 看 sheet 名判断是否天然钻单:
+       - 布心天然: sheet 名含 '结料'   (培育钻布心没有 '结料' 字样)
+       - 黛宝天然: sheet 名以 '出货单-' 开头 (培育钻黛宝是 '008-SG*')
+       - 通用   : sheet 名含 '真诚'
     """
     try:
         import openpyxl
         wb = openpyxl.load_workbook(xlsx_path, data_only=True, read_only=True)
         for sn in wb.sheetnames:
             if '结料' in sn or '真诚' in sn:
+                return True
+            if sn.startswith('出货单-'):
                 return True
     except Exception:
         pass

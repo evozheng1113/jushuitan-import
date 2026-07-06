@@ -404,12 +404,25 @@ def detect_factory(wb, excel_path=None):
     return None
 
 
-# ==================== 黛宝 解析 ====================
+# ==================== 黛宝 解析 (天然钻, sheet 名 "出货单-*") ====================
 def parse_daibao(xlsx_path, au_price, pt_price):
+    """黛宝天然钻工厂单 (sheet '出货单-SG*'):
+       表头 r4/r5 (真表头 r4=分类, r5=细分):
+         A序号 B款号 C条码号 E证书号 G手寸 H名称 J件数 K总重
+         M(13)金料1: N净重 O损耗 Q连耗金 R(18)折足金重 T金价 U金料总额
+         V(22)金料2: (双段金料, 通常一段有值)
+         AD(30)主石: AE(31)石重 AI(35)主钻
+         AJ-CC 副石(1-10) 每 5 列 一组: 品名/数量/石重/单价/金额
+           石重列: AL(38) AQ(43) AV(48) BA(53) BF(58) BK(63) BP(68) BU(73) BZ(78) CE(83)
+         CJ(88)副石镶工费 CK(89)主石镶工费 CL(90)其它工艺费 CM(91)加工费 CO(93)总价
+
+       镶嵌成本 = R折足金 × 金价 + CO总价
+    """
     wb = openpyxl.load_workbook(xlsx_path, data_only=True)
     target = next((n for n in wb.sheetnames if n.startswith('出货单-')), wb.sheetnames[0])
     ws = wb[target]
-    SIDE_W_COLS = [38, 43, 48, 53, 58, 63, 68, 73, 78]
+    # 副石 10 组的石重列位 (每组 5 列步长, 从 AL=38 起, 到 CE=83)
+    SIDE_W_COLS = [38, 43, 48, 53, 58, 63, 68, 73, 78, 83]
     items = []
     for r in range(6, ws.max_row + 1):
         a = ws.cell(row=r, column=1).value
@@ -421,9 +434,10 @@ def parse_daibao(xlsx_path, au_price, pt_price):
         qty     = ws.cell(row=r, column=10).value or 1
         weight  = ws.cell(row=r, column=11).value
         material = str(ws.cell(row=r, column=13).value or '').strip()
-        zhezu   = _num(ws.cell(row=r, column=18).value)
-        co_val  = _num(ws.cell(row=r, column=93).value)
-        side_w = sum(_num(ws.cell(row=r, column=c).value) for c in SIDE_W_COLS)
+        zhezu   = _num(ws.cell(row=r, column=18).value)   # R 折足金重
+        co_val  = _num(ws.cell(row=r, column=93).value)   # CO 总价
+        main_w  = _num(ws.cell(row=r, column=31).value)   # AE 主石石重
+        side_w  = sum(_num(ws.cell(row=r, column=c).value) for c in SIDE_W_COLS)
         gp = pt_price if 'PT' in material.upper() else au_price
         cost_mount = round(float(gp) * zhezu + co_val)
         mat_disp = 'PT950' if 'PT' in material.upper() else (material.split()[0] if material else '')
@@ -437,6 +451,7 @@ def parse_daibao(xlsx_path, au_price, pt_price):
             '材质颜色': mat_disp,
             '件数': int(qty) if isinstance(qty, (int, float)) else 1,
             '总重': weight,
+            '主石重量_ct': main_w if main_w > 0 else None,
             '副石重量_合计': round(side_w, 4) if side_w > 0 else None,
             '镶嵌成本': cost_mount,
         })
@@ -778,7 +793,7 @@ def build_jst_row(it, gia, factory_name):
         '证书': attrs.get('证书'),
         '分类': category,
         '形状': attrs.get('形状'),
-        '主石重量': attrs.get('主石重量'),
+        '主石重量': attrs.get('主石重量') or it.get('主石重量_ct'),
         '颜色等级': attrs.get('颜色等级'),
         '净度': attrs.get('净度'),
         '切工': attrs.get('切工'),
