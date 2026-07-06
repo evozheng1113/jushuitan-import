@@ -683,7 +683,15 @@ def parse_erchang(xlsx_path, au_price, pt_price):
         e = str(ws.cell(row=r, column=5).value or '').strip()
         f = ws.cell(row=r, column=6).value or 1
         g_wt = ws.cell(row=r, column=7).value
-        ab_total = _num(ws.cell(row=r, column=28).value)
+        # v19.8: 主石/副石重量抓取
+        #   主石组 (L-O): L 石号 M 粒数 N 主石ct O 镶费
+        #   辅石组 (P-T): P 石号 Q 粒数 R 辅石ct S 金额 T 微镶费   ← 相当于副石1
+        #   副石2 (U-X): U 石号 V 粒数 W 副石2ct X 微镶费
+        main_w  = _num(ws.cell(row=r, column=14).value)   # N 主石重ct
+        side1_w = _num(ws.cell(row=r, column=18).value)   # R 辅石重ct
+        side2_w = _num(ws.cell(row=r, column=23).value)   # W 副石2重ct
+        side_w_total = round(side1_w + side2_w, 4) if (side1_w + side2_w) > 0 else None
+        ab_total = _num(ws.cell(row=r, column=28).value)  # AB 合计 = 镶嵌成本
 
         e_up = e.upper()
         if 'PT' in e_up or '铂' in e:
@@ -704,8 +712,8 @@ def parse_erchang(xlsx_path, au_price, pt_price):
             '材质颜色': mat_disp,
             '件数': int(f) if isinstance(f, (int, float)) else 1,
             '总重': g_wt,
-            '主石重量_ct': None,
-            '副石重量_合计': None,
+            '主石重量_ct': main_w if main_w > 0 else None,
+            '副石重量_合计': side_w_total,
             '镶嵌成本': round(ab_total),
             '_sheet': ws.title,
             '_date': date_str,

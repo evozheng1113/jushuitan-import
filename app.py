@@ -302,7 +302,7 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
     jst_rows = [natural.build_jst_row(it, it['_gia'], factory_name) for it in items]
     out_path = tempfile.mktemp(suffix='.xlsx')
     date_str = datetime.now().strftime('%m-%d')
-    natural.gen_jst_xlsx(jst_rows, out_path, sheet_title=f'{factory_name}天然{date_str}')
+    natural.gen_jst_xlsx(jst_rows, out_path, sheet_title=f'{factory_name}真诚{date_str}')
     with open(out_path, 'rb') as f:
         data = f.read()
     try: os.unlink(out_path)
@@ -312,9 +312,9 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
     if red_count:
         st.warning(f"⚠️ {red_count} 件多散货, 客户名已标红 — 请人工核验")
 
-    fname = f'聚水潭_{factory_name}天然_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
+    fname = f'聚水潭_{factory_name}真诚_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
     st.download_button(
-        f"📥 下载 {factory_name} 天然钻聚水潭 ({len(items)} 件)",
+        f"📥 下载 {factory_name} 真诚聚水潭 ({len(items)} 件)",
         data=data, file_name=fname,
         mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         type="primary",
@@ -322,7 +322,7 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
     )
     st.session_state.setdefault('history', []).append({
         '时间': datetime.now().strftime('%H:%M:%S'),
-        '类型': f'聚水潭-{factory_name}天然',
+        '类型': f'聚水潭-{factory_name}真诚',
         '工厂': factory_name,
         '件数': len(items),
         '文件名': fname,
