@@ -483,11 +483,14 @@ def parse_buxin(xlsx_path, au_price, pt_price):
             weight  = ws.cell(row=r, column=9).value
             l_val   = _num(ws.cell(row=r, column=12).value)
             am_val  = _num(ws.cell(row=r, column=39).value)
-            # v19.3: 副石列位 (布心)
+            # v19.3/v19.6: 副石列位 (布心)
             #   副石1 组: U(21)数量  V(22)石重  W(23)单价  X(24)金额 ← 天然散货 (3200元/ct)
             #   副石2 组: Y(25)数量  Z(26)石重  AA(27)单价 AB(28)金额 ← 培育散货 (1120元/ct)
+            side1_w   = _num(ws.cell(row=r, column=22).value)  # V 副石1石重
             side1_amt = _num(ws.cell(row=r, column=24).value)  # X 副石1金额
+            side2_w   = _num(ws.cell(row=r, column=26).value)  # Z 副石2石重
             side2_amt = _num(ws.cell(row=r, column=28).value)  # AB 副石2金额
+            side_w_total = round(side1_w + side2_w, 4) if (side1_w + side2_w) > 0 else None
             if l_val <= 0: continue  # 跳过退货
             if not str(kuanhao or '').strip(): continue
             cost_mount = round(l_val * ratio * gp + am_val)
@@ -502,7 +505,7 @@ def parse_buxin(xlsx_path, au_price, pt_price):
                 '材质颜色': mat_disp,
                 '件数': int(qty) if isinstance(qty, (int, float)) else 1,
                 '总重': weight,
-                '副石重量_合计': None,
+                '副石重量_合计': side_w_total,
                 '镶嵌成本': cost_mount,
                 '_副石1金额': side1_amt,
                 '_副石2金额': side2_amt,
@@ -709,6 +712,30 @@ JST_COLS = [
 RED_FILL = PatternFill(start_color='FFCCCC', end_color='FFCCCC', fill_type='solid')
 
 
+# v19.6: 品名细化 - 从工厂单原始品名提取品类关键词, 拼上分类
+_PINMING_KEYWORDS = (
+    '女戒', '男戒', '对戒', '排戒', '戒指',
+    '手链', '手镯', '项链', '锁骨链', '颈链',
+    '耳钉', '耳环', '耳夹', '耳线', '耳坠',
+    '吊坠', '吊咀', '胸针', '脚链',
+)
+
+
+def _refine_pinming(category, raw_name):
+    """category = '培育钻石' / '天然钻石' (来自 _classify_stone)
+       raw_name = 工厂单品名 ('女戒' / '男戒' / '手链' / '手镯' / ...)
+       输出: '培育钻石女戒' / '天然钻石手链' 等
+       没识别到品类词的 → '{分类}戒指' (fallback)
+    """
+    if not raw_name:
+        return f'{category}戒指'
+    s = str(raw_name).strip()
+    for kw in _PINMING_KEYWORDS:
+        if kw in s:
+            return f'{category}{kw}'
+    return f'{category}{s}'
+
+
 def _classify_stone(cert_no, attrs, item=None):
     """按证书类型/副石位置决定分类, 优先级从高到低:
        1. 工厂单证书号 LG 开头 → 培育钻石 (LG = Lab Grown)
@@ -765,7 +792,7 @@ def build_jst_row(it, gia, factory_name):
         '成本3': round(cost3, 2) if cost3 > 0 else None,
         '成本价': round(total, 2) if total > 0 else None,
         '指圈号': it['手寸'],
-        '品名': '钻石戒指',
+        '品名': _refine_pinming(category, it.get('品名')),
         '数量': it['件数'],
         '材质颜色': it['材质颜色'],
         '总重': it['总重'],
