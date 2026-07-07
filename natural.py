@@ -186,11 +186,15 @@ def _parse_layout(header):
 
 
 def _load_gia_sheet(client, sheet_id):
+    """v19.10: 读取范围扩大
+       列: A→T (20列) 改为 A→AF (32列), 覆盖客户名/证书号/成本可能出现的所有列
+       行: 500 改为 2000, 一个月订货 sheet 通常几百条, 2000 足够
+    """
     if sheet_id in _GIA_CACHE:
         return _GIA_CACHE[sheet_id], _LAYOUT_CACHE[sheet_id]
-    header_rows = client.read_range(GIA_TOKEN, f'{sheet_id}!A1:T1')
+    header_rows = client.read_range(GIA_TOKEN, f'{sheet_id}!A1:AF1')
     layout = _parse_layout(header_rows[0] if header_rows else [])
-    rows = client.read_range(GIA_TOKEN, f'{sheet_id}!A2:T500')
+    rows = client.read_range(GIA_TOKEN, f'{sheet_id}!A2:AF2000')
     _GIA_CACHE[sheet_id] = rows
     _LAYOUT_CACHE[sheet_id] = layout
     return rows, layout
