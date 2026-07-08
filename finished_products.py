@@ -118,12 +118,19 @@ def sync_costs(fp_client, items):
             'response': None,
         }
 
-    # 建 key → item 映射 (跳过没 match_key 的)
+    # v20.5: 工厂单里同 match_key 出现多次 → 合并成 1 条, cost 相加
+    # (猛哥耳钉一对分两行, 每只一个成本 → 合并成一对总成本 → 成品新单里那条 M += 一对总成本)
     key_to_item = {}
     for it in items:
         k = str(it.get('match_key') or '').strip()
-        if k:
-            key_to_item[k] = it
+        if not k:
+            continue
+        if k in key_to_item:
+            key_to_item[k]['cost'] = (key_to_item[k].get('cost') or 0) + (it.get('cost') or 0)
+            # name 合并成 "#1 + #2 ..."
+            key_to_item[k]['name'] = f"{key_to_item[k].get('name', '')} + {it.get('name', '')}"
+        else:
+            key_to_item[k] = dict(it)   # 拷贝, 避免污染入参
 
     updates = []       # [(row_idx, col_letter, value)]
     match_log = []
@@ -174,6 +181,9 @@ def sync_costs(fp_client, items):
             'new_h': new_h,
         })
         remaining.discard(p_val)
+
+    # remaining = set of str (完全没在成品新单 P 列找到的 match_key)
+    remaining = sorted(remaining)
 
     # 批量写入
     response = None
