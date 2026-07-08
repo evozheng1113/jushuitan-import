@@ -673,6 +673,47 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                 with st.expander("详细错误"):
                     st.code(traceback.format_exc())
 
+        # v20: 自动同步镶嵌成本到成品新单 (飞书电子表格) M 列
+        # 匹配规则: P 列 = 飞书匹配键 (XH 现货单号 / 客户单号 / 证书号兜底)
+        # 只在培育钻流程 (非纯天然场景) 跑
+        try:
+            from finished_products import (FinishedProductsClient, sync_costs,
+                                            build_sync_items_from_factory_items)
+            sync_items = build_sync_items_from_factory_items(items)
+            if sync_items:
+                st.divider()
+                st.subheader(f"🔗 同步镶嵌成本到成品新单 ({len(sync_items)} 条)")
+                fp_client = FinishedProductsClient(
+                    _client.app_id, _client.app_secret)
+                with st.spinner(f"匹配 P 列 → 叠加写入 M 列..."):
+                    result = sync_costs(fp_client, sync_items)
+                matched = result['matched']
+                unmatched = result['unmatched']
+                errors = result['errors']
+
+                if matched:
+                    st.success(f"✅ 命中 {len(matched)} 条, M 列已叠加")
+                    with st.expander(f"命中详情 ({len(matched)})", expanded=False):
+                        lines = []
+                        for m in matched:
+                            lines.append(
+                                f"  r{m['row']:>4}  P={m['match_key']:<18} "
+                                f"M {m['old_m']:>6} + {m['add_cost']:>6} = "
+                                f"{m['new_m']:>6}  {m['name']}"
+                            )
+                        st.code('\n'.join(lines), language=None)
+                if unmatched:
+                    st.warning(f"⚠️ {len(unmatched)} 条没在成品新单 P 列找到: "
+                               + ', '.join(unmatched[:15])
+                               + ('...' if len(unmatched) > 15 else ''))
+                if errors:
+                    for e in errors:
+                        st.error(f"❌ {e}")
+        except Exception as e:
+            st.error(f"❌ 同步成品新单失败: {e}")
+            with st.expander("详细错误"):
+                st.code(traceback.format_exc())
+
         try:
             os.unlink(in_path)
         except OSError:

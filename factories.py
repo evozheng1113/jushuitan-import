@@ -448,12 +448,24 @@ def parse_B(excel_path, sheet_name=None, **kw):
         qty = ws.cell(row=r, column=6).value
         total_weight = ws.cell(row=r, column=7).value
         total = ws.cell(row=r, column=28).value or 0
+        # v20: 抓主石列 L (第 12 列) 作为证书编号
+        #      "厂配"/"库石"/"客料"/中文名 → 排除, 只留 GIA/IGI 号 (纯字母数字, 长度 >=6)
+        main_stone_raw = ws.cell(row=r, column=12).value
+        cert_no = None
+        if main_stone_raw is not None:
+            ms = str(main_stone_raw).strip()
+            # 无中文 + 长度 >=6 视作证书号
+            if ms and len(ms) >= 6 and not any('一' <= ch <= '鿿' for ch in ms):
+                cert_no = ms
         if not pinming and not invoice and not material and total == 0:
             continue
         inv = str(invoice or '').strip()
         if any(k in str(pinming or '') for k in REPAIR):
             cat = '维修'
         elif not inv:
+            cat = '现货'
+        elif re.match(r'^[A-Z]-XH-.+$', inv):
+            # v20: {工厂code}-XH-* 是工厂下单出的现货 (A=雅希 B=二厂 D=黛宝 E=猛哥)
             cat = '现货'
         elif re.match(r'^\d+-\d+-\d+$', inv) or re.match(r'^B-\d+-\d+-\d+$', inv):
             cat = '客户单'
@@ -466,7 +478,10 @@ def parse_B(excel_path, sheet_name=None, **kw):
         else:
             cat = '客户单'
         fly_key = None
-        if cat == '客户单':
+        if cat == '现货' and re.match(r'^[A-Z]-XH-.+$', inv):
+            # 现货 XH 单号 = 匹配成品新单的键 (完整 inv)
+            fly_key = inv
+        elif cat == '客户单':
             if inv.startswith('B-'):
                 fly_key = inv
             elif re.match(r'^\d+-\d+-\d+$', inv):
@@ -476,6 +491,7 @@ def parse_B(excel_path, sheet_name=None, **kw):
         items.append({'no': no, 'rows': [r], '类别': cat, '品名': pinming, '单号': invoice,
                       '成色': material, '件数': qty, '镶嵌成本': round(total),
                       '总重': total_weight,
+                      '证书编号': cert_no,   # v20: 主石 GIA/IGI 号 (兜底匹配用)
                       '飞书匹配键': fly_key,
                       '_sheet_idx': sheet_idx, '_sheet_title': ws.title})
     return items
@@ -507,31 +523,81 @@ def write_B(excel_path, items, out_path):
 
 
 # ============ 工厂 D: 黛宝 ============
+def _detect_D_columns(ws):
+    """扫描黛宝出货单 r4 表头, 返回字段列号.
+       v19.9: 新老表格差异 (新表 42 列, 老表 39 列, 每列左移 1-2 位)
+       字段: 序号 条码号 款号 件数 手寸 名称 成色 总重(g) 净金重(g) 损耗 连耗重(g) 折足 补口价 补口费 主石 副石 总金额
+    """
+    COL = {}
+    for c in range(1, ws.max_column + 1):
+        v = str(ws.cell(row=4, column=c).value or '').replace('\n', '').replace(' ', '').strip()
+        if not v: continue
+        if v == '序号': COL['序号'] = c
+        elif v == '条码号': COL['条码号'] = c
+        elif v == '款号': COL['款号'] = c
+        elif v == '件数': COL['件数'] = c
+        elif v == '手寸': COL['手寸'] = c
+        elif v == '名称': COL['名称'] = c
+        elif v == '成色': COL['成色'] = c
+        elif v.startswith('总重'): COL['总重'] = c
+        elif v == '折足': COL['折足'] = c
+        elif v == '主石': COL['主石'] = c
+        elif v == '副石': COL['副石'] = c
+        elif v == '总金额': COL['总金额'] = c
+    return COL
+
+
 def parse_D(excel_path, pt_price, au_price, **kw):
     excel_path = _ensure_xlsx(excel_path)
     wb = openpyxl.load_workbook(excel_path, data_only=True)
     ws = wb.active
+    COL = _detect_D_columns(ws)
+    # 关键字段兜底 (万一表头识别失败): 用老表位置作 fallback
+    col_序 = COL.get('序号', 1)
+    col_条码 = COL.get('条码号', 2)
+    col_款 = COL.get('款号', 3)
+    col_件 = COL.get('件数', 4)
+    col_名 = COL.get('名称', 7)
+    col_成 = COL.get('成色', 8)
+    col_总重 = COL.get('总重', 10)
+    col_折足 = COL.get('折足', 15)
+    col_主石 = COL.get('主石', 19)
+    col_总额 = COL.get('总金额', 38)
+
     items = []
     for r in range(6, ws.max_row + 1):
-        a = ws.cell(row=r, column=1).value
+        a = ws.cell(row=r, column=col_序).value
         if not isinstance(a, (int, float)):
             continue
         no = int(a)
-        barcode = ws.cell(row=r, column=2).value
-        kuanhao = ws.cell(row=r, column=3).value
-        name = ws.cell(row=r, column=7).value
-        material = ws.cell(row=r, column=8).value
-        total_weight = ws.cell(row=r, column=10).value
-        zhezu = ws.cell(row=r, column=15).value or 0
-        AL = ws.cell(row=r, column=38).value or 0
-        cert = ws.cell(row=r, column=4).value
+        barcode = ws.cell(row=r, column=col_条码).value
+        kuanhao = ws.cell(row=r, column=col_款).value
+        name = ws.cell(row=r, column=col_名).value
+        material = ws.cell(row=r, column=col_成).value
+        total_weight = ws.cell(row=r, column=col_总重).value
+        zhezu = ws.cell(row=r, column=col_折足).value or 0
+        AL = ws.cell(row=r, column=col_总额).value or 0
+        # 证书号 = 主石列的 GIA 号 (旧代码抓 D=件数=1, 是错的)
+        main_stone_no = ws.cell(row=r, column=col_主石).value
+        cert = str(main_stone_no).strip() if main_stone_no else None
+
         ks = str(kuanhao or '').strip()
-        if ks == '成品款式' or not ks:
-            cat, fly_key = '现货', None
+        has_main_stone = bool(main_stone_no)  # 有 GIA 主石号 = 客户单
+        if re.match(r'^[A-Z]-XH-.+$', ks):
+            # v20: {工厂code}-XH-* 是工厂下单出的现货 (D-XH-*)
+            cat, fly_key = '现货', ks
         elif re.match(r'^\d+-\d+-\d+$', ks):
+            # 老格式: 数字-数字-数字 (如 6-5-2)
             cat, fly_key = '客户单', f'D-{ks}'
+        elif ks == '成品款式' or not ks:
+            # 新表: 款号写"成品款式", 靠主石列判定
+            if has_main_stone:
+                cat, fly_key = '客户单', cert  # 用证书号做匹配键 (fallback)
+            else:
+                cat, fly_key = '现货', None
         else:
             cat, fly_key = '客户单', ks
+
         ms = str(material or '').upper()
         is_silver = _is_silver(material)
         if is_silver:
@@ -547,6 +613,7 @@ def parse_D(excel_path, pt_price, au_price, **kw):
                       '证书编号': cert, '品名': name, '成色': material, '件数': 1, '金价': gp,
                       '折足': zhezu, '工石费': AL, '镶嵌成本': cost,
                       '总重': total_weight, '_is_silver': is_silver,
+                      '_D_COL': COL,
                       '飞书匹配键': fly_key, '飞书客户名': None})
     return items
 
@@ -557,21 +624,33 @@ def write_D(excel_path, items, out_path):
     for it in items:
         r = it['rows'][0]
         gp = it['金价']
+        COL = it.get('_D_COL') or {}
+        # 总金额列 (回写公式的目标) — 新表可能是 39, 老表是 38
+        am_col = COL.get('总金额', 38)
+        # 折足列 (公式引用) — 新表 M(13), 老表 O(15)
+        zz_col = COL.get('折足', 15)
+        # 总金额列的**后 3 列** = 客户名/利润/利润率 (跟 write_D 原逻辑保持)
+        name_col = am_col + 1
+        profit_col = am_col + 2
+        rate_col = am_col + 3
+        zz_letter = openpyxl.utils.get_column_letter(zz_col)
+        am_letter = openpyxl.utils.get_column_letter(am_col)
+
         if it.get('_is_silver') or not gp:
             if it.get('镶嵌成本'):
-                modifications[(r, 39)] = it['镶嵌成本']
+                modifications[(r, am_col)] = it['镶嵌成本']
         else:
             cached = round(gp * (it['折足'] or 0) + (it['工石费'] or 0), 4)
-            modifications[(r, 39)] = (f'={gp}*O{r}+AL{r}', cached)
+            modifications[(r, am_col)] = (f'={gp}*{zz_letter}{r}+{am_letter}{r}', cached)
         an = '现货' if it['类别'] == '现货' else (it.get('飞书客户名') or '[待填]')
-        modifications[(r, 40)] = an
+        modifications[(r, name_col)] = an
         if it['类别'] == '客户单':
             profit = it.get('飞书利润')
             if isinstance(profit, (int, float)):
-                modifications[(r, 41)] = _profit(profit)
+                modifications[(r, profit_col)] = _profit(profit)
             rate = _fmt_profit_rate(it.get('飞书利润率'))
             if rate is not None:
-                modifications[(r, 42)] = _profit(rate)
+                modifications[(r, rate_col)] = _profit(rate)
     _patch_xlsx_cells(excel_path, out_path, modifications)
 
 
@@ -754,6 +833,9 @@ def parse_E(excel_path, pt_price, au_price, sheet_name=None, default_material=No
 
         if no == '19楼' or invoice_s == '19楼':
             cat, fly_key, customer = '部门-真诚', None, '真诚'
+        elif re.match(r'^[A-Z]-XH-.+$', invoice_s):
+            # v20: {工厂code}-XH-* 是工厂下单的现货 (E-XH-*)
+            cat, fly_key, customer = '现货', invoice_s, '现货'
         elif not invoice_s:
             cat, fly_key, customer = '现货', None, '现货'
         elif ORDER_LIKE.match(invoice_s):
