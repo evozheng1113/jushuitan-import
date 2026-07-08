@@ -303,16 +303,26 @@ def _row_match_name(row, layout, keys):
 
 def search_gia(client, order_sheets, kuanhao, cert_no):
     """
-    Step 1: 客户名精确/子串匹配
-    Step 2: 证书号兜底 (工厂证书号可能带 LG 前缀, 也去 LG 试)
+    v20.3 重写: 用证书号锁定唯一主石, 避免多颗主石累加成 cost1.
+
+    Step 1 (证书号锁定): 工厂单有证书号 → GIA 库存里找证书号 == 工厂号 的**唯一** 那条 → cost1
+    Step 2 (客户名扫描):
+        - 散货行 → cost2 累加 (cost2_count++)
+        - 主石行 (证书号 != Step 1 那条) → 计数 (main_stone_extra_count++), 不累加 cost1
+        - 如果 Step 1 没锁定 (无证书号 或 库存没这颗) → 用客户名第一条主石作 cost1
+
+    警示 (红底):
+        - 散货 >= 2 (客户名下多组散货)
+        - 主石额外行 >= 1 (客户名下除本颗还有其他主石)
     """
     hits = []
     cost1 = 0
     cost2 = 0
     cost2_count = 0
+    main_stone_extra_count = 0   # 客户名匹配到的额外主石行数 (排除 Step 1 那条)
     attrs = {}
     real_c_name = None
-    main_hit = None
+    main_hit_cert = None         # Step 1 锁定的证书号 (避免 Step 2 重复计算)
 
     keys = []
     if kuanhao:
@@ -321,37 +331,17 @@ def search_gia(client, order_sheets, kuanhao, cert_no):
         if rev: keys.append(rev)
 
     cert_no_str = str(cert_no or '').strip()
-    cert_variants = [cert_no_str] if cert_no_str else []
-    # 兜底 LG 前缀
-    if cert_no_str.upper().startswith('LG'):
-        cert_variants.append(cert_no_str[2:].lstrip('_-').strip())
+    cert_variants = []
+    if cert_no_str:
+        cert_variants.append(cert_no_str)
+        # 工厂号带 LG 前缀 → 也试去掉 LG (库存可能存无 LG 版)
+        if cert_no_str.upper().startswith('LG'):
+            cert_variants.append(cert_no_str[2:].lstrip('_-').strip())
 
-    # Step 1: 名字匹配
-    if keys:
+    # ---------- Step 1: 证书号锁定唯一主石行 ----------
+    if cert_variants:
         for sh in order_sheets:
-            title = sh.get('title', '')
-            rows, layout = _load_gia_sheet(client, sh.get('sheet_id'))
-            for row in rows:
-                matched, c_norm = _row_match_name(row, layout, keys)
-                if not matched: continue
-                d_val = str(_cell(row, layout.get('证书', -1)) or '').strip() if '证书' in layout else ''
-                p_val = _row_get_cost(row, layout)
-                if '散货' in d_val:
-                    cost2 += p_val
-                    cost2_count += 1
-                    hits.append(f'{title}:散货¥{p_val:.0f}')
-                else:
-                    cost1 += p_val
-                    if not attrs:
-                        attrs = _extract_attrs(row, layout)
-                        main_hit = (title, row, layout)
-                        real_c_name = c_norm
-                    hits.append(f'{title}:{d_val}¥{p_val:.0f}(C={c_norm})')
-
-    # Step 2: 证书号兜底
-    if not main_hit and cert_variants:
-        for sh in order_sheets:
-            if main_hit: break
+            if main_hit_cert: break
             title = sh.get('title', '')
             rows, layout = _load_gia_sheet(client, sh.get('sheet_id'))
             for row in rows:
@@ -359,41 +349,61 @@ def search_gia(client, order_sheets, kuanhao, cert_no):
                 if sheet_cert not in cert_variants: continue
                 attrs = _extract_attrs(row, layout)
                 p_val = _row_get_cost(row, layout)
-                d_val = attrs['证书']
-                if '散货' in d_val:
-                    cost2 += p_val
-                    cost2_count += 1
-                else:
-                    cost1 += p_val
+                d_val = attrs.get('证书', '') or ''
+                cost1 = p_val
+                main_hit_cert = sheet_cert
                 if '商品名称' in layout:
                     real_c_name = str(_cell(row, layout['商品名称']) or '').strip()
                 elif '销售' in layout and '客户' in layout:
                     sale = str(_cell(row, layout['销售']) or '').strip()
                     cust = str(_cell(row, layout['客户']) or '').strip()
                     real_c_name = f'{cust}-{sale}'
-                main_hit = (title, row, layout)
-                hits.append(f'{title}(证书号兜底):{d_val}¥{p_val:.0f}(C={real_c_name})')
+                hits.append(f'{title}(证书号锁定):{d_val}¥{p_val:.0f}(C={real_c_name})')
                 break
 
-        # 用真名找同款散货
-        if real_c_name:
-            for sh in order_sheets:
-                title = sh.get('title', '')
-                rows, layout = _load_gia_sheet(client, sh.get('sheet_id'))
-                for row in rows:
-                    matched, c_norm = _row_match_name(row, layout, [real_c_name])
-                    if not matched: continue
-                    if _row_get_cert_no(row, layout) in cert_variants: continue
-                    d_val = str(_cell(row, layout.get('证书', -1)) or '').strip() if '证书' in layout else ''
-                    p_val = _row_get_cost(row, layout)
-                    if '散货' in d_val:
-                        cost2 += p_val
-                        cost2_count += 1
-                        hits.append(f'{title}(真名找散货):散货¥{p_val:.0f}')
+    # ---------- Step 2: 客户名扫描 (散货累加 + 其他主石计数) ----------
+    scan_keys = list(keys)
+    if real_c_name and real_c_name not in scan_keys:
+        scan_keys.append(real_c_name)
+
+    if scan_keys:
+        for sh in order_sheets:
+            title = sh.get('title', '')
+            rows, layout = _load_gia_sheet(client, sh.get('sheet_id'))
+            for row in rows:
+                matched, c_norm = _row_match_name(row, layout, scan_keys)
+                if not matched: continue
+                sheet_cert = _row_get_cert_no(row, layout)
+                # 跳过 Step 1 已算过的证书号
+                if main_hit_cert and sheet_cert == main_hit_cert:
+                    continue
+
+                d_val = str(_cell(row, layout.get('证书', -1)) or '').strip() if '证书' in layout else ''
+                p_val = _row_get_cost(row, layout)
+                if '散货' in d_val:
+                    cost2 += p_val
+                    cost2_count += 1
+                    hits.append(f'{title}:散货¥{p_val:.0f}')
+                else:
+                    # 客户名的主石行
+                    if cost1 == 0:
+                        # Step 1 没锁定 (无证书号 或 库存里没这颗) → 用这条作 cost1
+                        cost1 = p_val
+                        attrs = _extract_attrs(row, layout)
+                        main_hit_cert = sheet_cert or f'__cust_{c_norm}__'
+                        real_c_name = real_c_name or c_norm
+                        hits.append(f'{title}(客户名主石):{d_val}¥{p_val:.0f}(C={c_norm})')
+                    else:
+                        # 已有 cost1, 这是"额外"主石 (客户不止一颗)
+                        main_stone_extra_count += 1
+                        hits.append(
+                            f'{title}(客户名额外主石):{d_val}¥{p_val:.0f}(证书={sheet_cert or "-"})'
+                        )
 
     return {
         'cost1': cost1, 'cost2': cost2,
         '散货行数': cost2_count,
+        '主石额外行数': main_stone_extra_count,   # v20.3
         'attrs': attrs,
         'debug': ';'.join(hits) if hits else '❌ 无匹配',
     }
@@ -811,11 +821,12 @@ def build_jst_row(it, gia, factory_name):
     cost2 = gia.get('cost2') or 0
     cost3 = it.get('镶嵌成本') or 0
     total = cost1 + cost2 + cost3
+    # v20.3: category (培育钻石/天然钻石) 只用于品名前缀, "分类"字段统一"成品"
     category = _classify_stone(it.get('证书号'), attrs, it)
     return {
         '商品名称': it['款号'],
         '证书': attrs.get('证书'),
-        '分类': category,
+        '分类': '成品',   # v20.3: 统一"成品" (培育/天然区分在"品名"字段里)
         '形状': attrs.get('形状'),
         '主石重量': attrs.get('主石重量') or it.get('主石重量_ct'),
         '颜色等级': attrs.get('颜色等级'),
@@ -840,7 +851,9 @@ def build_jst_row(it, gia, factory_name):
         '品牌': '真诚',
         '供应商名称': factory_name,
         '供应商名': factory_name,
-        '_红底': gia.get('散货行数', 0) >= 2,
+        # v20.3: 红底警示 - 散货多 或 客户名下还有其他主石行
+        '_红底': (gia.get('散货行数', 0) >= 2
+                   or gia.get('主石额外行数', 0) >= 1),
     }
 
 
