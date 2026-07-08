@@ -15,6 +15,7 @@ FP_TOKEN = 'IIwus3ROBhAR1et2anJcvdkTnNf'
 FP_SHEET_ID = '1XBqwN'   # sheet2 = 成品新单
 
 # 列位 (0-based 索引)
+COL_H = 7    # H 列 → 工厂状态 ("二厂待出货" → 匹配上同步后改为"二厂")
 COL_M = 12   # M 列 → 镶嵌成本 (叠加写入)
 COL_P = 15   # P 列 → 匹配键 (存 XH 单号 或 证书编号)
 
@@ -57,17 +58,18 @@ class FinishedProductsClient:
             headers=self._headers(), timeout=30)
         return r.json().get('data', {}).get('valueRange', {}).get('values', []) or []
 
-    def batch_write_M(self, updates):
-        """updates: [(row_idx, new_M_value), ...]  行号 1-based (含表头行)
-           批量写入 M 列
+    def batch_write(self, updates):
+        """updates: [(row_idx, col_letter, value), ...]
+           行号 1-based (含表头行), col_letter 'M'/'H'/'A' 等
+           支持一次写多列到多行
         """
         if not updates:
             return {'code': 0, 'updated_rows': 0, 'skipped': True}
         value_ranges = [
-            {'range': f'{self.sheet_id}!M{r}:M{r}', 'values': [[v]]}
-            for r, v in updates
+            {'range': f'{self.sheet_id}!{col}{r}:{col}{r}', 'values': [[v]]}
+            for r, col, v in updates
         ]
-        # 飞书批量: 每批最多 100 range, 大批分批
+        # 飞书批量: 每批最多 100 range
         BATCH = 100
         responses = []
         for i in range(0, len(value_ranges), BATCH):
@@ -79,6 +81,10 @@ class FinishedProductsClient:
                 timeout=30)
             responses.append(r.json())
         return {'code': 0, 'updated_rows': len(updates), 'responses': responses}
+
+    # 兼容旧调用
+    def batch_write_M(self, updates):
+        return self.batch_write([(r, 'M', v) for r, v in updates])
 
 
 def sync_costs(fp_client, items):
@@ -113,7 +119,7 @@ def sync_costs(fp_client, items):
         if k:
             key_to_item[k] = it
 
-    updates = []       # [(row_idx, new_M)]
+    updates = []       # [(row_idx, col_letter, value)]
     match_log = []
     remaining = set(key_to_item.keys())
 
@@ -138,8 +144,19 @@ def sync_costs(fp_client, items):
                     old_m = 0
         cost = it.get('cost') or 0
         new_m = round(old_m + cost)
+        updates.append((row_idx, 'M', new_m))
 
-        updates.append((row_idx, new_m))
+        # v20.1: H 列 "某某厂待出货" → "某某厂" (去掉"待出货")
+        old_h = ''
+        new_h = None
+        if len(row) > COL_H:
+            raw_h = row[COL_H]
+            if raw_h not in (None, ''):
+                old_h = str(raw_h).strip()
+                if '待出货' in old_h:
+                    new_h = old_h.replace('待出货', '').strip()
+                    updates.append((row_idx, 'H', new_h))
+
         match_log.append({
             'name': it.get('name', ''),
             'match_key': p_val,
@@ -147,6 +164,8 @@ def sync_costs(fp_client, items):
             'old_m': round(old_m),
             'add_cost': round(cost),
             'new_m': new_m,
+            'old_h': old_h,
+            'new_h': new_h,
         })
         remaining.discard(p_val)
 
@@ -155,7 +174,7 @@ def sync_costs(fp_client, items):
     errors = []
     if updates:
         try:
-            response = fp_client.batch_write_M(updates)
+            response = fp_client.batch_write(updates)
         except Exception as e:
             errors.append(f'写入失败: {e}')
 

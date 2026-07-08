@@ -692,14 +692,21 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                 errors = result['errors']
 
                 if matched:
-                    st.success(f"✅ 命中 {len(matched)} 条, M 列已叠加")
+                    h_updated = sum(1 for m in matched if m.get('new_h') is not None)
+                    st.success(
+                        f"✅ 命中 {len(matched)} 条, M 列已叠加"
+                        + (f", H 列 {h_updated} 条去掉「待出货」" if h_updated else "")
+                    )
                     with st.expander(f"命中详情 ({len(matched)})", expanded=False):
                         lines = []
                         for m in matched:
+                            h_str = ''
+                            if m.get('new_h') is not None:
+                                h_str = f"  H: {m['old_h']} → {m['new_h']}"
                             lines.append(
                                 f"  r{m['row']:>4}  P={m['match_key']:<18} "
                                 f"M {m['old_m']:>6} + {m['add_cost']:>6} = "
-                                f"{m['new_m']:>6}  {m['name']}"
+                                f"{m['new_m']:>6}  {m['name']}{h_str}"
                             )
                         st.code('\n'.join(lines), language=None)
                 if unmatched:
