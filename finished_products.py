@@ -25,14 +25,19 @@ class FinishedProductsClient:
 
     def __init__(self, app_id, app_secret,
                  spreadsheet_token=FP_TOKEN, sheet_id=FP_SHEET_ID):
+        import time as _time_mod
         self.app_id = app_id
         self.app_secret = app_secret
         self.spreadsheet_token = spreadsheet_token
         self.sheet_id = sheet_id
         self._tenant_token = None
+        self._token_expire = 0.0
+        self._time_mod = _time_mod
 
     def _get_tenant_token(self):
-        if self._tenant_token:
+        """v20.2: token 2 小时过期, 加提前 5 分钟自动刷新"""
+        now = self._time_mod.time()
+        if self._tenant_token and self._token_expire > now:
             return self._tenant_token
         r = requests.post(
             f'{FEISHU_BASE}/auth/v3/tenant_access_token/internal',
@@ -42,6 +47,7 @@ class FinishedProductsClient:
         if d.get('code') != 0:
             raise RuntimeError(f"飞书 token 失败: {d}")
         self._tenant_token = d['tenant_access_token']
+        self._token_expire = now + d.get('expire', 7200) - 300
         return self._tenant_token
 
     def _headers(self, json_body=False):

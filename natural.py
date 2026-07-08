@@ -120,12 +120,22 @@ def ensure_xlsx(path):
 
 # ==================== 飞书客户端 ====================
 class FeishuSheetClient:
+    """v20.2: token 自动过期刷新
+       飞书 tenant_access_token 2 小时有效期. 旧代码 self._token 永远缓存不刷新,
+       导致进程活过 2 小时后 GIA 查询全部 401 失败 (客户端表现: 属性/成本全空).
+    """
     def __init__(self, app_id, app_secret):
+        import time as _time_mod
         self.app_id, self.app_secret = app_id, app_secret
         self._token = None
+        self._token_expire = 0.0  # unix 时间戳, token 失效时间
+        self._time_mod = _time_mod
 
     def _get_token(self):
-        if self._token: return self._token
+        now = self._time_mod.time()
+        # 未过期 (提前 5 分钟视作过期) → 复用
+        if self._token and self._token_expire > now:
+            return self._token
         r = requests.post(
             f'{FEISHU_BASE}/auth/v3/tenant_access_token/internal',
             json={'app_id': self.app_id, 'app_secret': self.app_secret},
@@ -134,6 +144,8 @@ class FeishuSheetClient:
         if d.get('code') != 0:
             raise RuntimeError(f"飞书 token 失败: {d}")
         self._token = d['tenant_access_token']
+        expire_in = d.get('expire', 7200)   # 秒
+        self._token_expire = now + expire_in - 300  # 提前 5 分钟刷新
         return self._token
 
     def _headers(self):
