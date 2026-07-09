@@ -581,33 +581,21 @@ def parse_D(excel_path, pt_price, au_price, **kw):
         main_stone_no = ws.cell(row=r, column=col_主石).value
         cert = str(main_stone_no).strip() if main_stone_no else None
 
-        # v20.6: 读客户名列 (总金额列 +1, 即 AM 列或写入区第 1 列)
-        #        黛宝老表 AL(38)=总金额 → AM(39)=客户名
-        #        新表 AM(39)=总金额 → AN(40)=客户名
-        customer_col = col_总额 + 1
-        customer_val = ws.cell(row=r, column=customer_col).value
-        customer_str = str(customer_val or '').strip()
-        # 客户名 "[待填]" 或空 → 工厂还没定客户 = 现货
-        is_no_customer = (not customer_str) or customer_str == '[待填]'
-
+        # v20.8: 恢复原始简单规则 (用户昨天没问题的版本)
+        #   - {工厂code}-XH-* → 现货 (工厂下单)
+        #   - 数字-数字-数字 (如 7-6-2) → 客户单
+        #   - "成品款式" 或空 → 现货 (工厂做的标品, 用证书号匹配成品新单)
+        #   - 其他 (客户名/tb订单号等) → 客户单
+        # v19.9/v20.6/v20.7 加的"客户名列判断"/"成品款式+主石=客户单"都是错的, 删掉
         ks = str(kuanhao or '').strip()
-        has_main_stone = bool(main_stone_no)  # 有 GIA 主石号
+        has_main_stone = bool(main_stone_no)
         if re.match(r'^[A-Z]-XH-.+$', ks):
-            # {工厂code}-XH-* 是工厂下单出的现货 (D-XH-*)
             cat, fly_key = '现货', ks
-        elif is_no_customer and has_main_stone:
-            # v20.6: 客户名"[待填]"或空 + 有主石 → 现货
-            #        (工厂做出来还没客户, 用证书号匹配成品新单)
-            cat, fly_key = '现货', cert
         elif re.match(r'^\d+-\d+-\d+$', ks):
-            # 老格式: 数字-数字-数字 (如 6-5-2)
             cat, fly_key = '客户单', f'D-{ks}'
         elif ks == '成品款式' or not ks:
-            # 款号"成品款式" + 有主石 + 有客户名 → 客户单
-            if has_main_stone:
-                cat, fly_key = '客户单', cert
-            else:
-                cat, fly_key = '现货', None
+            # 款号"成品款式" = 现货 (用证书号做匹配键, 兜底用条码号)
+            cat, fly_key = '现货', cert
         else:
             cat, fly_key = '客户单', ks
 
