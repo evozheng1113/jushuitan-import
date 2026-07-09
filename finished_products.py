@@ -16,8 +16,8 @@ FP_SHEET_ID = '1XBqwN'   # sheet2 = 成品新单
 
 # 列位 (0-based 索引)
 COL_H = 7    # H 列 → 工厂状态 ("二厂待出货" → 匹配上同步后改为"二厂")
-COL_M = 12   # M 列 → 镶嵌成本 (叠加写入)
-COL_P = 15   # P 列 → 匹配键 (存 XH 单号 或 证书编号)
+COL_M = 12   # M 列 → 镶嵌成本 (叠加写入, 固定)
+COL_P = 6    # v20.10: 匹配键在 G 列 (第 7 列, 存 XH 单号 或 证书编号 如 755505076-2)
 
 
 class FinishedProductsClient:
