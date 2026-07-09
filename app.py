@@ -462,7 +462,8 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                               or fields.get('状态'))
                 status_text = _client.get_text(status_val) or ''
                 c['_飞书货物状态'] = status_text
-                is_refunded = '已退款' in status_text
+                # v20.6: "退货中" 也视为退货 (跟"已退款"同处理)
+                is_refunded = any(kw in status_text for kw in ('已退款', '退货中', '退货'))
                 feishu_hit += 1
 
                 # 写
