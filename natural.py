@@ -10,7 +10,7 @@
     export FS_APP_SECRET='xxx'
     python3 natural.py <工厂单.xls> --au 900 --pt 380
 """
-import os, sys, re, argparse, subprocess
+import os, sys, re, argparse, subprocess, math
 from datetime import datetime
 import openpyxl
 from openpyxl.styles import PatternFill
@@ -465,7 +465,7 @@ def parse_daibao(xlsx_path, au_price, pt_price):
         main_w  = _num(ws.cell(row=r, column=31).value)   # AE 主石石重
         side_w  = sum(_num(ws.cell(row=r, column=c).value) for c in SIDE_W_COLS)
         gp = pt_price if 'PT' in material.upper() else au_price
-        cost_mount = round(float(gp) * zhezu + co_val)
+        cost_mount = math.ceil(float(gp) * zhezu + co_val)
         mat_disp = 'PT950' if 'PT' in material.upper() else (material.split()[0] if material else '')
         items.append({
             'no': int(a), 'row': r,
@@ -534,7 +534,7 @@ def parse_buxin(xlsx_path, au_price, pt_price):
             side_w_total = round(side1_w + side2_w, 4) if (side1_w + side2_w) > 0 else None
             if l_val <= 0: continue  # 跳过退货
             if not str(kuanhao or '').strip(): continue
-            cost_mount = round(l_val * ratio * gp + am_val)
+            cost_mount = math.ceil(l_val * ratio * gp + am_val)
             no += 1
             items.append({
                 'no': no, 'row': r,
@@ -648,8 +648,8 @@ def parse_menggou(xlsx_path, au_price, pt_price):
             jin_zhi = 0
 
         # 镶嵌成本 = 金值 + 各项工费/石费
-        cost = round(jin_zhi + peijian_fei + zhushi_jin + fushi_jin +
-                     xiangshi_fei + xzhushi_fei + banla + gongyi + gongfei)
+        cost = math.ceil(jin_zhi + peijian_fei + zhushi_jin + fushi_jin +
+                          xiangshi_fei + xzhushi_fei + banla + gongyi + gongfei)
 
         mat_up = material.upper()
         if 'PT' in mat_up: mat_disp = 'PT950'
@@ -740,7 +740,7 @@ def parse_erchang(xlsx_path, au_price, pt_price):
             '总重': g_wt,
             '主石重量_ct': main_w if main_w > 0 else None,
             '副石重量_合计': side_w_total,
-            '镶嵌成本': round(ab_total),
+            '镶嵌成本': math.ceil(ab_total),
             '_sheet': ws.title,
             '_date': date_str,
         })

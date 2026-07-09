@@ -4,7 +4,7 @@
 - 凭证: Streamlit Cloud Secrets 加密存
 """
 import streamlit as st
-import tempfile, os, traceback, re, time
+import tempfile, os, traceback, re, time, math
 from datetime import datetime
 
 import factories
@@ -483,7 +483,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                         note = ' [已退款→¥0]'
                     else:
                         if not overwrite and existing_cost > 0:
-                            final_cost = round(existing_cost + today_cost)
+                            final_cost = math.ceil(existing_cost + today_cost)
                             accumulated += 1
                             note = f' (原{int(existing_cost)}+{today_cost})'
                         else:

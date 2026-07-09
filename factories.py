@@ -249,7 +249,7 @@ def parse_A(excel_path, pt_price, au_price, sheet_name=None, **kw):
             cands = [r for r in recycle_by_order.get(key, []) if id(r) not in processed_recycles]
             if cands:
                 rec = cands[0]
-                it['镶嵌成本'] = round((it['镶嵌成本'] or 0) + (rec['镶嵌成本'] or 0))
+                it['镶嵌成本'] = math.ceil((it['镶嵌成本'] or 0) + (rec['镶嵌成本'] or 0))
                 processed_recycles.add(id(rec))
 
     merged = []
@@ -259,7 +259,7 @@ def parse_A(excel_path, pt_price, au_price, sheet_name=None, **kw):
         nxt = items[i + 1] if i + 1 < len(items) else None
         if (cur['类别'] == '客户单' and nxt and nxt['类别'] == '旧金回收'
                 and id(nxt) not in processed_recycles):
-            cur['镶嵌成本'] = round((cur['镶嵌成本'] or 0) + (nxt['镶嵌成本'] or 0))
+            cur['镶嵌成本'] = math.ceil((cur['镶嵌成本'] or 0) + (nxt['镶嵌成本'] or 0))
             processed_recycles.add(id(nxt))
             merged.append(cur)
             merged.append(nxt)
@@ -324,7 +324,7 @@ def _aggregate_A(ws, rows, pt_price, au_price):
     if cat == '旧金回收':
         ab = ws.cell(row=r0, column=28).value
         if isinstance(ab, (int, float)) and ab < 0:
-            cost = round(ab)
+            cost = math.ceil(ab)
         else:
             gold_cost = sum_M * (pt_price or 0) + sum_N * (au_price or 0)
             s = g = l = z = o = 0
@@ -334,13 +334,13 @@ def _aggregate_A(ws, rows, pt_price, au_price):
                 l += _num(ws.cell(row=r, column=25).value)
                 z += _num(ws.cell(row=r, column=26).value)
                 o += _num(ws.cell(row=r, column=27).value)
-            cost = round(gold_cost + s + g + l + z + o)
+            cost = math.ceil(gold_cost + s + g + l + z + o)
     elif cat in ('修理', '内部-跳过', '退还'):
         cost = 0
     elif is_silver:
         ab = ws.cell(row=r0, column=28).value
         if isinstance(ab, (int, float)):
-            cost = round(ab)
+            cost = math.ceil(ab)
         else:
             p = _num(ws.cell(row=r0, column=16).value)
             s = g = l = z = o = 0
@@ -350,7 +350,7 @@ def _aggregate_A(ws, rows, pt_price, au_price):
                 l += _num(ws.cell(row=r, column=25).value)
                 z += _num(ws.cell(row=r, column=26).value)
                 o += _num(ws.cell(row=r, column=27).value)
-            cost = round(p + s + g + l + z + o)
+            cost = math.ceil(p + s + g + l + z + o)
     else:
         gold_cost = sum_M * (pt_price or 0) + sum_N * (au_price or 0)
         s = g = l = z = o = 0
@@ -360,7 +360,7 @@ def _aggregate_A(ws, rows, pt_price, au_price):
             l += _num(ws.cell(row=r, column=25).value)
             z += _num(ws.cell(row=r, column=26).value)
             o += _num(ws.cell(row=r, column=27).value)
-        cost = round(gold_cost + s + g + l + z + o)
+        cost = math.ceil(gold_cost + s + g + l + z + o)
 
     fly_key = f'A-{order_str.strip()}' if cat == '客户单' and order else None
     return {'no': no, 'rows': rows, '类别': cat, '下单编号': order, '单号': invoice, '证书编号': cert,
@@ -489,7 +489,7 @@ def parse_B(excel_path, sheet_name=None, **kw):
             else:
                 fly_key = inv
         items.append({'no': no, 'rows': [r], '类别': cat, '品名': pinming, '单号': invoice,
-                      '成色': material, '件数': qty, '镶嵌成本': round(total),
+                      '成色': material, '件数': qty, '镶嵌成本': math.ceil(total),
                       '总重': total_weight,
                       '证书编号': cert_no,   # v20: 主石 GIA/IGI 号 (兜底匹配用)
                       '飞书匹配键': fly_key,
@@ -603,13 +603,13 @@ def parse_D(excel_path, pt_price, au_price, **kw):
         is_silver = _is_silver(material)
         if is_silver:
             gp = 0
-            cost = round(AL)
+            cost = math.ceil(AL)
         else:
             if 'PT950' in ms:
                 gp = pt_price
             else:
                 gp = au_price
-            cost = round(zhezu * gp + AL) if gp else round(AL)
+            cost = math.ceil(zhezu * gp + AL) if gp else math.ceil(AL)
         items.append({'no': no, 'rows': [r, r + 1], '类别': cat, '条码号': barcode, '款号': kuanhao,
                       '证书编号': cert, '品名': name, '成色': material, '件数': 1, '金价': gp,
                       '折足': zhezu, '工石费': AL, '镶嵌成本': cost,
@@ -821,13 +821,13 @@ def parse_E(excel_path, pt_price, au_price, sheet_name=None, default_material=No
 
         if is_silver:
             factory_AF = _num(ws.cell(row=r, column=COL['总金额']).value)
-            cost = round(factory_AF) if factory_AF else round(
+            cost = math.ceil(factory_AF) if factory_AF else math.ceil(
                 peijian_fei + zhushi_jin + fushi_jin + xiangshi_fei +
                 xzhushi_fei + banla + gongyi + gongfei
             )
         else:
-            cost = round(jin_zhi + peijian_fei + zhushi_jin + fushi_jin +
-                         xiangshi_fei + xzhushi_fei + banla + gongyi + gongfei)
+            cost = math.ceil(jin_zhi + peijian_fei + zhushi_jin + fushi_jin +
+                              xiangshi_fei + xzhushi_fei + banla + gongyi + gongfei)
 
         invoice_s = str(invoice or '').strip()
         normalized = _normalize_order(invoice_s)
@@ -858,14 +858,17 @@ def parse_E(excel_path, pt_price, au_price, sheet_name=None, default_material=No
                       '飞书匹配键': fly_key, '飞书客户名': customer,
                       '_sheet_idx': sheet_idx, '_sheet_title': ws.title})
 
-    # v15.5: 合并连续同单号+同品名的行 (一对耳钉工厂占两行, 业务上算 1 件)
+    # v15.5 + v22.1: 合并连续同单号+同品名的行 (一对耳钉工厂占两行, 业务上算 1 件)
+    # v22.1 修正: 猛哥工厂出货是一只一只的成本, 需相加合并成一对总成本
+    #        (旧版只保留第一行, 导致成本少一半)
     merged = []
     for it in items:
         if (merged and it['类别'] == '客户单' and merged[-1]['类别'] == '客户单'
                 and it.get('飞书匹配键') and it.get('飞书匹配键') == merged[-1].get('飞书匹配键')
                 and it.get('品名') == merged[-1].get('品名')):
-            # 合并到前一个 item: 保留成本(相同) + rows 追加
+            # 合并到前一个 item: rows 追加 + 成本相加
             merged[-1]['rows'].extend(it['rows'])
+            merged[-1]['镶嵌成本'] = (merged[-1].get('镶嵌成本') or 0) + (it.get('镶嵌成本') or 0)
         else:
             merged.append(it)
     return merged

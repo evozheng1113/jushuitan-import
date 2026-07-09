@@ -7,6 +7,7 @@
 
 用户飞书表格: https://icnikyg9yylq.feishu.cn/sheets/IIwus3ROBhAR1et2anJcvdkTnNf?sheet=1XBqwN
 """
+import math
 import requests
 
 FEISHU_BASE = 'https://open.feishu.cn/open-apis'
@@ -177,7 +178,7 @@ def sync_costs(fp_client, items):
                 except (ValueError, TypeError):
                     old_m = 0
         cost = it.get('cost') or 0
-        new_m = round(old_m + cost)
+        new_m = math.ceil(old_m + cost)
         updates.append((row_idx, 'M', new_m))
 
         # v20.1: H 列 "某某厂待出货" → "某某厂" (去掉"待出货")

@@ -63,7 +63,10 @@ def _normalize_dashes(s):
     return re.sub(r'-+', '-', str(s))
 
 
-def normalize_cert_to_code(cert, factory_code=None):
+def normalize_cert_to_code(cert, factory_code=None, is_spot=False):
+    """
+    v22.2: 现货 (is_spot=True) → -2 后缀, 客户单 → -1 后缀
+    """
     if cert is None:
         return None
     s = str(cert).strip()
@@ -75,18 +78,21 @@ def normalize_cert_to_code(cert, factory_code=None):
     s = _normalize_dashes(s)
     s = re.sub(r'\s+[a-zA-Z]+(?:-\d+)?$', '', s).rstrip()
 
+    suffix = '-2' if is_spot else '-1'
+
     dash_count = s.count('-')
     if dash_count >= 2:
         return s
     if dash_count == 1:
         prefix, _, last = s.rpartition('-')
         if last in ('1', '2'):
+            # 已带 -1/-2, 按 is_spot 重置成正确后缀
             s = prefix
         else:
             return s
     if factory_code == 'D' and not s.startswith('D'):
-        return f'D{s}-1'
-    return f'{s}-1'
+        return f'D{s}{suffix}'
+    return f'{s}{suffix}'
 
 
 def normalize_material(material):
@@ -144,7 +150,9 @@ def build_row_from_item(item, factory_code, feishu_cert,
                         feishu_luozuan=0, feishu_peishi=0,
                         feishu_main_stone=None, feishu_ring_size=None,
                         total_weight=None, is_natural=False):
-    code = normalize_cert_to_code(feishu_cert, factory_code=factory_code)
+    # v22.2: 现货 -2, 客户单 -1
+    is_spot = item.get('类别') == '现货'
+    code = normalize_cert_to_code(feishu_cert, factory_code=factory_code, is_spot=is_spot)
     if not code:
         order = item.get('下单编号') or item.get('单号')
         if order and factory_code != 'D':
@@ -157,7 +165,7 @@ def build_row_from_item(item, factory_code, feishu_cert,
     row['主石类别'] = '天然钻石' if is_natural else '培育钻石'
     row['数量'] = 1
     row['分类'] = '成品1'
-    row['品牌'] = '倾城'
+    row['品牌'] = '倾诚'
     row['供应商名称'] = SUPPLIER_MAP.get(factory_code, '')
     row['供应商名'] = SUPPLIER_MAP.get(factory_code, '')
     row['商品编码'] = code
