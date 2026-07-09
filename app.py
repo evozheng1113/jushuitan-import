@@ -704,8 +704,10 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                             h_str = ''
                             if m.get('new_h') is not None:
                                 h_str = f"  H: {m['old_h']} → {m['new_h']}"
+                            # v20.9: 显示成品新单 P 列原值 (可能带 -N 后缀)
+                            p_display = m.get('p_val') or m.get('match_key')
                             lines.append(
-                                f"  r{m['row']:>4}  P={m['match_key']:<18} "
+                                f"  r{m['row']:>4}  P={p_display:<18} "
                                 f"M {m['old_m']:>6} + {m['add_cost']:>6} = "
                                 f"{m['new_m']:>6}  {m['name']}{h_str}"
                             )

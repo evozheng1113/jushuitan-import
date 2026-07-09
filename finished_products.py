@@ -136,16 +136,37 @@ def sync_costs(fp_client, items):
     match_log = []
     remaining = set(key_to_item.keys())
 
+    def _find_matching_key(p_val):
+        """v20.9: 支持成品新单 P 列尾部带 -N 后缀 (如 P=755505076-2 匹配 fly_key=755505076)
+           顺序:
+             1. 完全相等 (最优先)
+             2. p_val startswith fly_key + '-数字' (证书号+后缀)
+        """
+        if p_val in key_to_item:
+            return p_val
+        for k in key_to_item:
+            if not k or not p_val.startswith(k):
+                continue
+            rest = p_val[len(k):]
+            # rest 必须是 "-数字" (避免误匹配 755505076 匹配到 7555050761 等)
+            import re as _re
+            if _re.match(r'^-\d+$', rest):
+                return k
+        return None
+
     for row_idx, row in enumerate(rows, start=1):
         if row_idx == 1:
             continue  # 表头
         if len(row) <= COL_P:
             continue
         p_val = str(row[COL_P] or '').strip()
-        if not p_val or p_val not in key_to_item:
+        if not p_val:
+            continue
+        matched_key = _find_matching_key(p_val)
+        if not matched_key:
             continue
 
-        it = key_to_item[p_val]
+        it = key_to_item[matched_key]
         # 读 M 列原值
         old_m = 0
         if len(row) > COL_M:
@@ -172,7 +193,8 @@ def sync_costs(fp_client, items):
 
         match_log.append({
             'name': it.get('name', ''),
-            'match_key': p_val,
+            'match_key': matched_key,   # 工厂单 fly_key (可能带 P 列后缀显示)
+            'p_val': p_val,             # 成品新单 P 列原值
             'row': row_idx,
             'old_m': round(old_m),
             'add_cost': round(cost),
@@ -180,7 +202,7 @@ def sync_costs(fp_client, items):
             'old_h': old_h,
             'new_h': new_h,
         })
-        remaining.discard(p_val)
+        remaining.discard(matched_key)
 
     # remaining = set of str (完全没在成品新单 P 列找到的 match_key)
     remaining = sorted(remaining)
