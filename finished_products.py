@@ -18,7 +18,9 @@ FP_SHEET_ID = '1XBqwN'   # sheet2 = 成品新单
 # 列位 (0-based 索引)
 COL_H = 7    # H 列 → 工厂状态 ("二厂待出货" → 匹配上同步后改为"二厂")
 COL_M = 12   # M 列 → 镶嵌成本 (叠加写入, 固定)
-COL_P = 6    # v20.10: 匹配键在 G 列 (第 7 列, 存 XH 单号 或 证书编号 如 755505076-2)
+# v22.5: 不再硬编码匹配键的列位, 每行扫全部单元格自动识别
+#        (证书号可能在 G 列, XH 单号可能在 P 列, 各表不同. 让代码自己判断)
+COL_P = 6    # 兼容旧引用
 
 
 class FinishedProductsClient:
@@ -158,12 +160,20 @@ def sync_costs(fp_client, items):
     for row_idx, row in enumerate(rows, start=1):
         if row_idx == 1:
             continue  # 表头
-        if len(row) <= COL_P:
-            continue
-        p_val = str(row[COL_P] or '').strip()
-        if not p_val:
-            continue
-        matched_key = _find_matching_key(p_val)
+
+        # v22.5: 每行扫全部单元格, 自动识别哪一列存了匹配键
+        #        条件: 值含 '-' 且长度 >=5 (排除成本数字、单一字符等)
+        matched_key = None
+        matched_p_val = None
+        for cell in row:
+            s = str(cell or '').strip()
+            if len(s) < 5 or '-' not in s:
+                continue
+            k = _find_matching_key(s)
+            if k:
+                matched_key = k
+                matched_p_val = s
+                break
         if not matched_key:
             continue
 
@@ -194,11 +204,11 @@ def sync_costs(fp_client, items):
 
         match_log.append({
             'name': it.get('name', ''),
-            'match_key': matched_key,   # 工厂单 fly_key (可能带 P 列后缀显示)
-            'p_val': p_val,             # 成品新单 P 列原值
+            'match_key': matched_key,   # 工厂单 fly_key
+            'p_val': matched_p_val,     # 成品新单里实际存的值 (含可能的 -N 后缀)
             'row': row_idx,
-            'old_m': round(old_m),
-            'add_cost': round(cost),
+            'old_m': math.ceil(old_m),
+            'add_cost': math.ceil(cost),
             'new_m': new_m,
             'old_h': old_h,
             'new_h': new_h,
