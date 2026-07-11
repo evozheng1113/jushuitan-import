@@ -246,6 +246,18 @@ def _split_multi(s):
     return [p.strip() for p in parts if p and p.strip()]
 
 
+def _strip_cert_prefix(s):
+    """v22.8: 去证书号前缀 (工厂单常带 IGI/GIA/LG, 成品新单只存数字部分).
+       例: 'IGI807626332' → '807626332'
+           'GIA 3555452881' → '3555452881'
+           'LG786602329' → '786602329'
+    """
+    if not s:
+        return s
+    m = _re_fp.match(r'^\s*(IGI|GIA|LG)\s*(.+)$', str(s), _re_fp.IGNORECASE)
+    return m.group(2).strip() if m else str(s).strip()
+
+
 def build_sync_items_from_factory_items(factory_items):
     """把 factories.parse_X 返回的 items 转成 sync_costs 需要的格式.
        v22.6: 只同步现货件 (客户单走飞书多维表).
@@ -277,16 +289,18 @@ def build_sync_items_from_factory_items(factory_items):
                 keys.append(line)
 
         # 优先 2: 若 C 列没有 XH, 从 E 列拆多证书号 (如两只戒指 2 个 IGI)
+        # v22.8: 去 IGI/GIA/LG 前缀 (成品新单只存数字部分, 如 807626332-2)
         if not keys:
             for line in _split_multi(cert):
                 if len(line) >= 5:
-                    keys.append(line)
+                    keys.append(_strip_cert_prefix(line))
 
-        # 兜底: 单一 fly_key / D 列单号 / E 列证书号
+        # 兜底: 单一 fly_key / D 列单号 / E 列证书号 (证书号也去前缀)
         if not keys:
             for candidate in (it.get('飞书匹配键'), invoice, cert):
                 if candidate and str(candidate).strip():
-                    keys.append(str(candidate).strip())
+                    val = str(candidate).strip()
+                    keys.append(_strip_cert_prefix(val) if candidate is cert else val)
                     break
 
         if not keys:
