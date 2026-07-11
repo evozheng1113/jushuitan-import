@@ -237,12 +237,15 @@ def sync_costs(fp_client, items):
 
 def build_sync_items_from_factory_items(factory_items):
     """把 factories.parse_X 返回的 items 转成 sync_costs 需要的格式.
+       v22.6: 只同步现货件 (客户单走飞书多维表, 修理/退还/内部-跳过 不算成品).
        - 现货 XH 单号: match_key = 飞书匹配键 (完整单号 B-XH-*)
-       - 客户单: match_key = 飞书匹配键 (客户单号 / 客户名)
-       - 兜底: 有证书编号且没 match_key → match_key = 证书编号
+       - 现货兜底: 有证书编号且没 match_key → match_key = 证书编号
     """
+    SPOT_LIKE = ('现货', '部门-真诚')  # 只这些类别同步到成品新单
     sync_items = []
     for it in factory_items:
+        if it.get('类别') not in SPOT_LIKE:
+            continue
         cost = it.get('镶嵌成本')
         if not cost:
             continue
