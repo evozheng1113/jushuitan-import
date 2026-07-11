@@ -300,15 +300,13 @@ def _aggregate_A(ws, rows, pt_price, au_price):
         cat = '退还'
     elif '旧金回收' in str(cert or ''):
         cat = '旧金回收'
-    elif re.match(r'^A-XH-.+$', order_str.strip()):
-        # v22.6: 通用 A-XH-* 格式现货 (兼容, 万一以后工厂改回 XH 格式)
+    elif order_str.startswith('2026-'):
         cat = '现货'
-    elif re.match(r'^A-\d+-\d+-\d+$', order_str.strip()):
-        # v22.6: 广州(雅希)现货单号格式 = A-数字-数字-数字 (如 A-6-30-3, A-7-6-1)
-        # 用户: 客户单无 A- 前缀, 现货有 A- 但无 XH; 不改工厂出货单, 代码这边兼容
+    elif re.search(r'[A-Z]-XH-', order_str.upper()):
+        # v22.7: C 列含 A-XH- / B-XH- ... 即 XH 单号 (可能换行分隔多个)
         cat = '现货'
-    elif re.match(r'^20\d{2}-', order_str):
-        # 日期式现货编号 (原 2026- 硬编码升级为通用 20XX-)
+    elif invoice_str.rstrip().endswith('-XH'):
+        # v22.7: D 列 -XH 结尾 (如 260718-XH), 说明这件是现货, E 列可能有多个证书号
         cat = '现货'
     elif '真诚' in invoice_str or '真诚' in order_str:
         cat = '部门-真诚'
@@ -370,13 +368,7 @@ def _aggregate_A(ws, rows, pt_price, au_price):
             o += _num(ws.cell(row=r, column=27).value)
         cost = math.ceil(gold_cost + s + g + l + z + o)
 
-    # v22.6: 现货直接用原样单号 (含 A- 前缀); 客户单加 A- 前缀去查飞书多维表
-    if cat == '现货' and order_str.strip():
-        fly_key = order_str.strip()
-    elif cat == '客户单' and order:
-        fly_key = f'A-{order_str.strip()}'
-    else:
-        fly_key = None
+    fly_key = f'A-{order_str.strip()}' if cat == '客户单' and order else None
     return {'no': no, 'rows': rows, '类别': cat, '下单编号': order, '单号': invoice, '证书编号': cert,
             '品名': style, '成色': material, '件数': qty, '金价': gp, '镶嵌成本': cost,
             '总重': total_weight,

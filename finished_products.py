@@ -235,13 +235,29 @@ def sync_costs(fp_client, items):
     }
 
 
+import re as _re_fp
+
+
+def _split_multi(s):
+    """把多单号/多证书号字符串按 换行/斜杠/中文逗号/顿号 拆开, 去空."""
+    if not s:
+        return []
+    parts = _re_fp.split(r'[\n\r/、,，;；]+', str(s))
+    return [p.strip() for p in parts if p and p.strip()]
+
+
 def build_sync_items_from_factory_items(factory_items):
     """把 factories.parse_X 返回的 items 转成 sync_costs 需要的格式.
-       v22.6: 只同步现货件 (客户单走飞书多维表, 修理/退还/内部-跳过 不算成品).
-       - 现货 XH 单号: match_key = 飞书匹配键 (完整单号 B-XH-*)
-       - 现货兜底: 有证书编号且没 match_key → match_key = 证书编号
+       v22.6: 只同步现货件 (客户单走飞书多维表).
+       v22.7: 支持一件拆多个 sync_items (C 列多 XH 换行 / E 列多证书号换行),
+              一件成本按拆分数量均分 (向上取整).
+
+       优先级:
+         1. 下单编号 C 列里含 XH 单号 → 每个 XH 一条
+         2. 证书编号 E 列多证书号 → 每个证书号一条
+         3. 兜底: 飞书匹配键 / 单号 / 证书号
     """
-    SPOT_LIKE = ('现货', '部门-真诚')  # 只这些类别同步到成品新单
+    SPOT_LIKE = ('现货', '部门-真诚')
     sync_items = []
     for it in factory_items:
         if it.get('类别') not in SPOT_LIKE:
@@ -249,19 +265,45 @@ def build_sync_items_from_factory_items(factory_items):
         cost = it.get('镶嵌成本')
         if not cost:
             continue
-        match_key = it.get('飞书匹配键')
-        if not match_key:
-            cert = it.get('证书编号')
-            if cert:
-                match_key = str(cert).strip()
-        if not match_key:
+
+        order = it.get('下单编号') or ''
+        cert = it.get('证书编号') or ''
+        invoice = it.get('单号') or ''
+
+        # 优先 1: C 列拆出所有 A-XH-*/B-XH-*/D-XH-*/E-XH-* 类的单号
+        keys = []
+        for line in _split_multi(order):
+            if _re_fp.search(r'[A-Za-z]-XH-', line):
+                keys.append(line)
+
+        # 优先 2: 若 C 列没有 XH, 从 E 列拆多证书号 (如两只戒指 2 个 IGI)
+        if not keys:
+            for line in _split_multi(cert):
+                if len(line) >= 5:
+                    keys.append(line)
+
+        # 兜底: 单一 fly_key / D 列单号 / E 列证书号
+        if not keys:
+            for candidate in (it.get('飞书匹配键'), invoice, cert):
+                if candidate and str(candidate).strip():
+                    keys.append(str(candidate).strip())
+                    break
+
+        if not keys:
             continue
+
+        # 成本均分, 向上取整 (每只都 ceil, 总额可能略高于原成本 —— 用户业务偏保守)
+        import math as _math_fp
+        per_cost = _math_fp.ceil(cost / len(keys))
         pinming = it.get('品名') or ''
         no = it.get('no') or ''
-        sync_items.append({
-            'match_key': match_key,
-            'cost': cost,
-            'name': f'#{no} {pinming}',
-            '_类别': it.get('类别'),
-        })
+
+        for idx, k in enumerate(keys, start=1):
+            tag = f' ({idx}/{len(keys)})' if len(keys) > 1 else ''
+            sync_items.append({
+                'match_key': k,
+                'cost': per_cost,
+                'name': f'#{no} {pinming}{tag}',
+                '_类别': it.get('类别'),
+            })
     return sync_items
