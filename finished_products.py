@@ -121,37 +121,29 @@ def sync_costs(fp_client, items):
             'response': None,
         }
 
-    # v20.5: 工厂单里同 match_key 出现多次 → 合并成 1 条, cost 相加
-    # (猛哥耳钉一对分两行, 每只一个成本 → 合并成一对总成本 → 成品新单里那条 M += 一对总成本)
-    key_to_item = {}
+    # v22.10: 队列消费 (支持同 key 多条: 广州1行=N件拆成 N 条同 key)
+    #         猛哥场景不受影响, 因为 parse_E 已在解析层合并 rows+cost 相加,
+    #         build_sync_items 生成的是 1 条 sync_item (队列 1 条)
+    from collections import deque
+    key_queue = {}   # match_key → deque of items
     for it in items:
         k = str(it.get('match_key') or '').strip()
         if not k:
             continue
-        if k in key_to_item:
-            key_to_item[k]['cost'] = (key_to_item[k].get('cost') or 0) + (it.get('cost') or 0)
-            # name 合并成 "#1 + #2 ..."
-            key_to_item[k]['name'] = f"{key_to_item[k].get('name', '')} + {it.get('name', '')}"
-        else:
-            key_to_item[k] = dict(it)   # 拷贝, 避免污染入参
+        key_queue.setdefault(k, deque()).append(dict(it))
 
     updates = []       # [(row_idx, col_letter, value)]
     match_log = []
-    remaining = set(key_to_item.keys())
+    all_keys_seen = set(key_queue.keys())
 
     def _find_matching_key(p_val):
-        """v20.9: 支持成品新单 P 列尾部带 -N 后缀 (如 P=755505076-2 匹配 fly_key=755505076)
-           顺序:
-             1. 完全相等 (最优先)
-             2. p_val startswith fly_key + '-数字' (证书号+后缀)
-        """
-        if p_val in key_to_item:
+        """v20.9: 支持成品新单 P 列尾部带 -N 后缀 (如 P=755505076-2 匹配 fly_key=755505076)"""
+        if p_val in key_queue and key_queue[p_val]:
             return p_val
-        for k in key_to_item:
-            if not k or not p_val.startswith(k):
+        for k, q in key_queue.items():
+            if not k or not q or not p_val.startswith(k):
                 continue
             rest = p_val[len(k):]
-            # rest 必须是 "-数字" (避免误匹配 755505076 匹配到 7555050761 等)
             import re as _re
             if _re.match(r'^-\d+$', rest):
                 return k
@@ -177,7 +169,8 @@ def sync_costs(fp_client, items):
         if not matched_key:
             continue
 
-        it = key_to_item[matched_key]
+        # v22.10: 队列消费 (每次匹配 pop 一个, 同 key 多条时按顺序各消费一次)
+        it = key_queue[matched_key].popleft()
         # 读 M 列原值
         old_m = 0
         if len(row) > COL_M:
@@ -213,10 +206,11 @@ def sync_costs(fp_client, items):
             'old_h': old_h,
             'new_h': new_h,
         })
-        remaining.discard(matched_key)
-
-    # remaining = set of str (完全没在成品新单 P 列找到的 match_key)
-    remaining = sorted(remaining)
+    # v22.10: remaining = 队列还有剩余的 items (工厂单里有但成品新单没足够对应行)
+    remaining = []
+    for k in sorted(key_queue.keys()):
+        for it in key_queue[k]:
+            remaining.append(f"{k}(¥{it.get('cost')} {it.get('name', '')})")
 
     # 批量写入
     response = None
@@ -306,7 +300,20 @@ def build_sync_items_from_factory_items(factory_items):
         if not keys:
             continue
 
-        # 成本均分, 向上取整 (每只都 ceil, 总额可能略高于原成本 —— 用户业务偏保守)
+        # v22.10: 广州场景 — 工厂单一行 = N 件同款 (数量列 > 1),
+        #         需要拆成 N 条同 key sync_item, 每条 1/N 成本;
+        #         成品新单 N 行同 XH → 每行分别匹配一条 (队列消费, sync_costs 里做)
+        qty = it.get('件数') or 1
+        try:
+            qty = int(qty)
+        except (ValueError, TypeError):
+            qty = 1
+        if qty < 1:
+            qty = 1
+        if len(keys) == 1 and qty > 1:
+            keys = keys * qty   # 复制 N 份, 相同 match_key
+
+        # 成本均分, 向上取整 (每只都 ceil, 总额可能略高于原成本 —— 偏保守)
         import math as _math_fp
         per_cost = _math_fp.ceil(cost / len(keys))
         pinming = it.get('品名') or ''
