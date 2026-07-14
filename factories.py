@@ -864,15 +864,15 @@ def parse_E(excel_path, pt_price, au_price, sheet_name=None, default_material=No
                       '飞书匹配键': fly_key, '飞书客户名': customer,
                       '_sheet_idx': sheet_idx, '_sheet_title': ws.title})
 
-    # v15.5 + v22.1: 合并连续同单号+同品名的行 (一对耳钉工厂占两行, 业务上算 1 件)
-    # v22.1 修正: 猛哥工厂出货是一只一只的成本, 需相加合并成一对总成本
-    #        (旧版只保留第一行, 导致成本少一半)
+    # v15.5 + v22.1 + v22.12: 合并连续同单号+同品名的行 (一对耳钉工厂占两行, 业务上算 1 件)
+    # v22.12 修正: 合并条件覆盖 客户单 + 现货 (v22.1 只对客户单, 但 XH 是现货, 从没合并)
+    # 合并策略: rows 追加 + 成本相加 (猛哥工厂出货一只一只的成本, 合并成一对总成本)
+    MERGEABLE = ('客户单', '现货')
     merged = []
     for it in items:
-        if (merged and it['类别'] == '客户单' and merged[-1]['类别'] == '客户单'
+        if (merged and it['类别'] in MERGEABLE and merged[-1]['类别'] == it['类别']
                 and it.get('飞书匹配键') and it.get('飞书匹配键') == merged[-1].get('飞书匹配键')
                 and it.get('品名') == merged[-1].get('品名')):
-            # 合并到前一个 item: rows 追加 + 成本相加
             merged[-1]['rows'].extend(it['rows'])
             merged[-1]['镶嵌成本'] = (merged[-1].get('镶嵌成本') or 0) + (it.get('镶嵌成本') or 0)
         else:
