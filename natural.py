@@ -851,9 +851,16 @@ def build_jst_row(it, gia, factory_name):
         '品牌': '真诚',
         '供应商名称': factory_name,
         '供应商名': factory_name,
-        # v20.3: 红底警示 - 散货多 或 客户名下还有其他主石行
+        # v20.3 + v22.11: 红底警示 —— 三种情况任一满足就标红:
+        #   1) 散货行 ≥ 2 (客户多次配石)
+        #   2) 客户名下有额外主石 (回头客/对戒)
+        #   3) v22.11: GIA 库存完全没找到这个客户 (无属性 + 无成本 + 无散货)
         '_红底': (gia.get('散货行数', 0) >= 2
-                   or gia.get('主石额外行数', 0) >= 1),
+                   or gia.get('主石额外行数', 0) >= 1
+                   or (not attrs.get('证书')
+                       and (gia.get('cost1') or 0) == 0
+                       and (gia.get('cost2') or 0) == 0
+                       and gia.get('散货行数', 0) == 0)),
     }
 
 
