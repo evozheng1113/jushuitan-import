@@ -135,14 +135,29 @@ class FeishuClient:
     # ============ 元数据 ============
     def list_fields(self, app_token, table_id):
         """列出表的所有字段. 返回 [{field_name, type, ...}, ...]
-        用于运行时自适应字段名 (真诚多维表 v23 场景)."""
+        v24.6: 加 code!=0 raise, 避免权限/错 token 被静默当"表空".
+        """
         url = (f'https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}'
                f'/tables/{table_id}/fields?page_size=100')
         r = requests.get(url, headers=self._headers(), timeout=10)
-        return r.json().get('data', {}).get('items', []) or []
+        data = r.json()
+        code = data.get('code')
+        if code != 0:
+            raise RuntimeError(
+                f"list_fields 失败 app_token={app_token[:10]}... "
+                f"table_id={table_id[:10]}... code={code} msg={data.get('msg')!r}\n"
+                f"→ 常见原因: (1) 飞书 app 未被授权访问这张 base "
+                f"(去多维表右上「...」→「设置」→「协作与分享」→ 添加机器人); "
+                f"(2) app_token 或 table_id 错; (3) 权限范围没勾 bitable:app"
+            )
+        return data.get('data', {}).get('items', []) or []
 
     # ============ 查询 ============
     def find_by_field(self, app_token, table_id, field_name, value):
+        """v24.4: 加 code check + 出错抛异常 (避免 code!=0 被静默当成 not_found).
+        另: 飞书 records/search 支持 operator=is (文本/单选/数字), 但只对
+        文本/单选返回真值; 关联字段需要 record_id.
+        """
         url = (f'https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}'
                f'/tables/{table_id}/records/search')
         body = {
@@ -151,12 +166,19 @@ class FeishuClient:
                 "conditions": [{
                     "field_name": field_name,
                     "operator": "is",
-                    "value": [value],
+                    "value": [str(value)],   # 强制字符串
                 }],
             }
         }
         r = requests.post(url, headers=self._headers(), json=body, timeout=10)
-        items = r.json().get('data', {}).get('items', [])
+        data = r.json()
+        code = data.get('code')
+        if code != 0:
+            raise RuntimeError(
+                f"飞书 records/search 失败 field={field_name!r} value={value!r} "
+                f"code={code} msg={data.get('msg')!r}"
+            )
+        items = data.get('data', {}).get('items', []) or []
         return items[0] if items else None
 
     def find_by_order_number(self, app_token, table_id, order_number):
