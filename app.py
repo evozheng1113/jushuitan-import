@@ -338,16 +338,18 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
             from zhencheng_bitable import sync_zhencheng_costs
 
             st.subheader(f"🔗 同步镶嵌成本到真诚多维表 ({len(items)} 件)")
-            with st.spinner("查询字段结构 + 逐条写入..."):
+            with st.spinner("查询字段结构 + 逐条写入 + 轮询等公式..."):
                 app_id, app_secret = load_credentials()
                 bitable_client = FeishuClient(app_id, app_secret)
                 sync_result = sync_zhencheng_costs(bitable_client, items)
 
             st.success(
                 f"✅ 匹配 **{sync_result['matched']}** / 写入 **{sync_result['updated']}** "
-                f"| 证书字段=`{sync_result.get('cert_field') or '(无)'}` "
-                f"款号字段=`{sync_result.get('name_field') or '(无)'}` "
-                f"成本字段=`{sync_result['cost_field']}`"
+                f"| 证书=`{sync_result.get('cert_field') or '(无)'}` "
+                f"款号=`{sync_result.get('name_field') or '(无)'}` "
+                f"成本=`{sync_result['cost_field']}` "
+                f"利润=`{sync_result.get('profit_field') or '(无)'}` "
+                f"利润率=`{sync_result.get('rate_field') or '(无)'}`"
             )
             if sync_result['not_found']:
                 st.warning(f"⚠️ {len(sync_result['not_found'])} 条没匹配到: "
@@ -358,19 +360,106 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
                 for err in sync_result['errors'][:5]:
                     st.text(f"  {err}")
 
-            with st.expander("📋 每条详情"):
+            with st.expander("📋 每条详情 (含利润率)", expanded=True):
                 for d in sync_result['details']:
                     ico = {'updated': '✅', 'would_update': '🔵', 'not_found': '⚠️',
                            'error': '❌', 'skip': '⏭️'}.get(d.get('status'), '·')
                     line = (f"{ico} #{d.get('no')} 证书={d.get('cert') or '空'} "
-                            f"客户={d.get('name') or '空'} status={d.get('status')}")
-                    if d.get('matched_by'):
-                        line += f" [{d['matched_by']}]"
+                            f"客户={d.get('name') or '空'}")
                     if d.get('cost') is not None:
                         line += f" 成本={d['cost']}"
+                    if d.get('profit') is not None:
+                        line += f" 利润={int(d['profit'])}"
+                    if d.get('rate') is not None:
+                        line += f" 利润率={d['rate']*100:.1f}%"
+                    if d.get('note'):
+                        line += d['note']
                     if d.get('reason'):
                         line += f" ({d['reason']})"
                     st.text(line)
+
+            # v24.1: 利润简报 xlsx 下载 (只有实际写入了才生成)
+            if sync_result['updated'] > 0:
+                try:
+                    import openpyxl
+                    from openpyxl.styles import PatternFill, Font
+                    from datetime import datetime as _dt
+                    wb = openpyxl.Workbook()
+                    ws = wb.active
+                    ws.title = f'{factory_name}利润'
+                    headers = ['序号', '客户名(款号)', '证书号', '品名', '材质',
+                               '件数', '镶嵌成本', '飞书利润', '利润率', '备注']
+                    for c, h in enumerate(headers, 1):
+                        ws.cell(row=1, column=c).value = h
+                        ws.cell(row=1, column=c).font = Font(bold=True)
+                    RED = PatternFill('solid', fgColor='FFC7CE')
+                    YEL = PatternFill('solid', fgColor='FFEB9C')
+                    for i, it in enumerate(items, 2):
+                        rate = it.get('飞书利润率')
+                        ws.cell(row=i, column=1).value = it.get('no')
+                        ws.cell(row=i, column=2).value = it.get('款号')
+                        ws.cell(row=i, column=3).value = it.get('证书号')
+                        ws.cell(row=i, column=4).value = it.get('品名')
+                        ws.cell(row=i, column=5).value = it.get('材质颜色')
+                        ws.cell(row=i, column=6).value = it.get('件数')
+                        ws.cell(row=i, column=7).value = it.get('镶嵌成本')
+                        ws.cell(row=i, column=8).value = it.get('飞书利润')
+                        rc = ws.cell(row=i, column=9)
+                        rc.value = rate
+                        if rate is not None:
+                            rc.number_format = '0.00%'
+                            if rate < 0.15:
+                                rc.fill = RED
+                                ws.cell(row=i, column=10).value = '利润率偏低'
+                            elif rate > 0.70:
+                                rc.fill = YEL
+                                ws.cell(row=i, column=10).value = '利润率异常高'
+                    profit_path = tempfile.mktemp(suffix='.xlsx')
+                    wb.save(profit_path)
+                    with open(profit_path, 'rb') as f:
+                        profit_data = f.read()
+                    try: os.unlink(profit_path)
+                    except OSError: pass
+                    profit_fname = f'{_dt.now().strftime("%Y%m%d")}_{factory_name}_利润简报.xlsx'
+                    st.download_button(
+                        f"📊 下载利润简报 ({len(items)} 件)",
+                        data=profit_data, file_name=profit_fname,
+                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                        key=f'dl_profit_{factory_name}_{_dt.now().timestamp()}',
+                    )
+                except Exception as e:
+                    st.warning(f"生成利润简报失败 (不影响主流程): {e}")
+
+                # v24.2: 工厂单完成文件 (原表追加 4 列: 总镶嵌成本/客户名/利润/利润率)
+                try:
+                    complete_path = tempfile.mktemp(suffix='.xlsx')
+                    natural.write_natural_complete(in_path, items, complete_path)
+                    with open(complete_path, 'rb') as f:
+                        complete_data = f.read()
+                    try: os.unlink(complete_path)
+                    except OSError: pass
+                    base = uploaded_name.rsplit('.', 1)[0]
+                    complete_fname = f'{datetime.now().strftime("%Y%m%d")}{base}_完成.xlsx'
+                    st.download_button(
+                        f"📥 下载工厂单完成文件 ({factory_name}, 追加4列)",
+                        data=complete_data, file_name=complete_fname,
+                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                        type="primary",
+                        key=f'dl_natcomplete_{factory_name}_{datetime.now().timestamp()}',
+                    )
+                    st.caption("完成文件在原表最右侧追加: 总镶嵌成本 | 客户名称 | 利润 | 利润率")
+                    st.session_state.setdefault('history', []).append({
+                        '时间': datetime.now().strftime('%H:%M:%S'),
+                        '类型': f'工厂单完成-{factory_name}真诚',
+                        '工厂': factory_name,
+                        '件数': len(items),
+                        '文件名': complete_fname,
+                        '_data': complete_data,
+                    })
+                except Exception as e:
+                    st.error(f"❌ 生成工厂单完成文件失败: {e}")
+                    with st.expander("详细错误"):
+                        st.code(traceback.format_exc())
         except Exception as e:
             st.error(f"❌ 同步真诚多维表失败: {e}")
             with st.expander("详细错误"):

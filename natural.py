@@ -480,6 +480,7 @@ def parse_daibao(xlsx_path, au_price, pt_price):
             '主石重量_ct': main_w if main_w > 0 else None,
             '副石重量_合计': round(side_w, 4) if side_w > 0 else None,
             '镶嵌成本': cost_mount,
+            '_sheet': target,   # v24.2: writer 需要
         })
     return items
 
@@ -878,6 +879,59 @@ def gen_jst_xlsx(rows, out_path, sheet_title):
         if row_data.get('_红底'):
             for col_idx in (1, 24):
                 ws.cell(row=r_idx, column=col_idx).fill = RED_FILL
+    wb.save(out_path)
+
+
+# ==================== v24.2 工厂单完成文件 writer ====================
+# 惯例布局 (仿培育钻 write_D):
+#   目标列 = 总镶嵌成本
+#   目标列+1 = 客户名称 (天然钻场景 = 款号)
+#   目标列+2 = 利润 (回读飞书公式)
+#   目标列+3 = 利润率
+# 目标列位: 每家表里 max_column + 1 (追加, 不覆盖原表)
+# Header 行: 每家数据首行的上一行, 保证紧贴数据便于阅读
+
+_WRITE_HEADERS = ('总镶嵌成本', '客户名称', '利润', '利润率')
+
+
+def write_natural_complete(in_path, items, out_path):
+    """在原工厂单追加 4 列并生成完成文件.
+       items 需已经过 sync_zhencheng_costs 回读利润/利润率.
+       每 item 必须带 row / _sheet / 款号 / 镶嵌成本 (可选: 飞书利润, 飞书利润率).
+    """
+    wb = openpyxl.load_workbook(in_path)
+
+    # 按 sheet 分组
+    by_sheet = {}
+    for it in items:
+        sn = it.get('_sheet')
+        if not sn or sn not in wb.sheetnames:
+            # 兜底: 最后一个 sheet (猛哥/二厂惯例)
+            sn = wb.sheetnames[-1]
+        by_sheet.setdefault(sn, []).append(it)
+
+    for sname, its in by_sheet.items():
+        ws = wb[sname]
+        # 追加到 max_column+1 (保留原表所有列)
+        first_col = ws.max_column + 1
+        # header 行: 数据首行的上一行 (至少 1)
+        header_row = max(1, min(it['row'] for it in its) - 1)
+        for i, h in enumerate(_WRITE_HEADERS):
+            ws.cell(row=header_row, column=first_col + i).value = h
+
+        for it in its:
+            r = it['row']
+            ws.cell(row=r, column=first_col).value = it.get('镶嵌成本')
+            ws.cell(row=r, column=first_col + 1).value = it.get('款号')  # 天然钻款号=客户名
+            profit = it.get('飞书利润')
+            if isinstance(profit, (int, float)):
+                ws.cell(row=r, column=first_col + 2).value = round(profit)
+            rate = it.get('飞书利润率')
+            if isinstance(rate, (int, float)):
+                c = ws.cell(row=r, column=first_col + 3)
+                c.value = rate
+                c.number_format = '0.00%'
+
     wb.save(out_path)
 
 

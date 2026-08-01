@@ -1,4 +1,4 @@
-"""真诚部门 - 天然钻工厂单 → 飞书多维表 镶嵌成本同步 (v23.1)
+"""真诚部门 - 天然钻工厂单 → 飞书多维表 镶嵌成本同步 (v24.1)
 
 匹配逻辑 = 真诚聚水潭 build_jst_row 的对齐版本:
   聚水潭里 `商品编码 = natural._norm_code(证书号)` (去多杠, 补 -1 后缀).
@@ -15,7 +15,7 @@
 猛哥同款号多行 (一对耳钉两只) 会写 2 次覆盖 → 需要多维表侧本身也是每只一条记录, 否则丢第一只.
 后者是多维表设计问题, 不在同步侧解决 (跟聚水潭输出策略一致).
 """
-import re
+import re, time
 from feishu_client import FeishuClient, load_credentials
 from natural import _norm_code
 
@@ -29,6 +29,14 @@ ZHENCHENG_TABLE_ID  = 'tblzKxchN598phDb'
 CERT_FIELD_CANDIDATES = ['证书编码', '证书编号', '证书号', '商品编码']
 NAME_FIELD_CANDIDATES = ['客户名', '客户名称', '客户', '下单单号', '款号']
 COST_FIELD_CANDIDATES = ['镶嵌成本', '成本2', '镶嵌费', '加工费', '镶工费', '工费']
+# v24.1: 回读用 (公式字段, 只读)
+PROFIT_FIELD_CANDIDATES = ['利润', '利润额', '毛利']
+RATE_FIELD_CANDIDATES   = ['利润率', '毛利率']
+
+
+# ============ 利润率阈值 (触发警示) ============
+PROFIT_RATE_LOW  = 0.15
+PROFIT_RATE_HIGH = 0.70
 
 
 _STRIP_CERT_RE = re.compile(r'^\s*(IGI|GIA|LG)\s*(.+)$', re.IGNORECASE)
@@ -71,6 +79,54 @@ def _pick_field(fields_meta, candidates):
     return None
 
 
+def _get_record_by_id(client, app_token, table_id, record_id):
+    """GET 单条记录 (用于轮询公式刷新)."""
+    import requests
+    url = (f'https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}'
+           f'/tables/{table_id}/records/{record_id}')
+    r = requests.get(url, headers=client._headers(), timeout=10)
+    return r.json().get('data', {}).get('record', {})
+
+
+def _wait_formula_refresh(client, record_id, cost_field, target_cost,
+                           profit_field, rate_field, max_wait=6):
+    """v24.1: 写完镶嵌成本后轮询等公式刷新, 返回 (profit, rate).
+       判断: 记录里 cost_field 已刷新到 target_cost, 再等 0.4s 让下游公式算完.
+    """
+    deadline = time.time() + max_wait
+    last_rec = None
+    while time.time() < deadline:
+        try:
+            rec = _get_record_by_id(client, ZHENCHENG_APP_TOKEN,
+                                     ZHENCHENG_TABLE_ID, record_id)
+        except Exception:
+            rec = None
+        if rec:
+            last_rec = rec
+            fields = rec.get('fields', {})
+            cur_cost = FeishuClient.get_number(fields.get(cost_field))
+            if cur_cost is not None and abs(cur_cost - target_cost) < 0.5:
+                time.sleep(0.4)
+                try:
+                    rec2 = _get_record_by_id(client, ZHENCHENG_APP_TOKEN,
+                                              ZHENCHENG_TABLE_ID, record_id)
+                    if rec2:
+                        fields = rec2.get('fields', {})
+                except Exception:
+                    pass
+                profit = FeishuClient.get_number(fields.get(profit_field)) if profit_field else None
+                rate   = FeishuClient.get_number(fields.get(rate_field)) if rate_field else None
+                return profit, rate, True
+        time.sleep(0.5)
+    # 超时: 兜底读一次现有值 (可能公式还没刷新)
+    if last_rec:
+        fields = last_rec.get('fields', {})
+        profit = FeishuClient.get_number(fields.get(profit_field)) if profit_field else None
+        rate   = FeishuClient.get_number(fields.get(rate_field)) if rate_field else None
+        return profit, rate, False
+    return None, None, False
+
+
 def sync_zhencheng_costs(client, items, dry_run=False):
     """把 items 里每件的 镶嵌成本 写到真诚多维表对应记录.
 
@@ -86,6 +142,7 @@ def sync_zhencheng_costs(client, items, dry_run=False):
         'matched': 0, 'updated': 0,
         'not_found': [], 'errors': [],
         'cert_field': None, 'name_field': None, 'cost_field': None,
+        'profit_field': None, 'rate_field': None,   # v24.1
         'details': [], 'dry_run': dry_run,
     }
 
@@ -115,9 +172,15 @@ def sync_zhencheng_costs(client, items, dry_run=False):
             f"→ 请加进 CERT_FIELD_CANDIDATES 或 NAME_FIELD_CANDIDATES"
         )
 
+    # v24.1: 回读用 (公式字段, 找不到不算错)
+    profit_field = _pick_field(fields_meta, PROFIT_FIELD_CANDIDATES)
+    rate_field   = _pick_field(fields_meta, RATE_FIELD_CANDIDATES)
+
     result['cert_field'] = cert_field
     result['name_field'] = name_field
     result['cost_field'] = cost_field
+    result['profit_field'] = profit_field
+    result['rate_field']   = rate_field
 
     # ---- 逐条同步 ----
     for it in items:
@@ -183,9 +246,27 @@ def sync_zhencheng_costs(client, items, dry_run=False):
             client.update_record(ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID,
                                  rec_id, {cost_field: cost})
             result['updated'] += 1
+
+            # v24.1: 轮询等公式刷新, 回读利润/利润率写回 item
+            profit, rate, refreshed = _wait_formula_refresh(
+                client, rec_id, cost_field, cost, profit_field, rate_field)
+            it['飞书利润']   = profit
+            it['飞书利润率'] = rate
+            note = ' [⚠️公式刷新慢]' if not refreshed else ''
+
+            # 阈值警示
+            warn = ''
+            if rate is not None:
+                if rate < PROFIT_RATE_LOW:
+                    warn = f' 🔴利润率低({rate*100:.1f}%)'
+                elif rate > PROFIT_RATE_HIGH:
+                    warn = f' 🟡利润率异常高({rate*100:.1f}%)'
+
             result['details'].append({'no': no, 'cert': cert, 'name': name,
                                        'status': 'updated',
-                                       'matched_by': matched_by, 'cost': cost})
+                                       'matched_by': matched_by, 'cost': cost,
+                                       'profit': profit, 'rate': rate,
+                                       'note': note + warn})
         except Exception as e:
             result['errors'].append(f"#{no} 写入失败: {e}")
             result['details'].append({'no': no, 'cert': cert, 'name': name,
