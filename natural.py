@@ -913,10 +913,20 @@ def write_natural_complete(in_path, items, out_path):
 
     for sname, its in by_sheet.items():
         ws = wb[sname]
-        # 追加到 max_column+1 (保留原表所有列)
-        first_col = ws.max_column + 1
-        # header 行: 数据首行的上一行 (至少 1)
+        # v24.8: 不能用 ws.max_column (会返回 16384 上限, 因为原表有大量空但带格式的列)
+        # 扫描表头行 + 数据行, 找 "真实有数据" 的最右列
         header_row = max(1, min(it['row'] for it in its) - 1)
+        rows_to_scan = {header_row, header_row - 1} | {it['row'] for it in its}
+        real_max = 0
+        scan_upto = min(ws.max_column, 500)   # 天然钻工厂单最多几十列, 500 是安全上限
+        for r in rows_to_scan:
+            if r < 1: continue
+            for c in range(1, scan_upto + 1):
+                v = ws.cell(r, c).value
+                if v is not None and str(v).strip():
+                    if c > real_max:
+                        real_max = c
+        first_col = max(real_max, 1) + 1
         for i, h in enumerate(_WRITE_HEADERS):
             ws.cell(row=header_row, column=first_col + i).value = h
 
