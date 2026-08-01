@@ -217,7 +217,8 @@ def get_gia_client():
 
 
 # ---------------- 天然钻流程 (共用: 黛宝 / 布心 / 猛哥 / 二厂) ----------------
-def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_months=6):
+def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_months=6,
+                          sync_feishu=False):
     """
     跑一次天然钻流程: 解析 → 查 GIA → 生成聚水潭 xlsx + 下载按钮.
     factory_name: natural.PARSERS 的键 ('黛宝'/'布心'/'猛哥'/'二厂')
@@ -328,6 +329,55 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
         '文件名': fname,
         '_data': data,
     })
+
+    # v23: 同步镶嵌成本到真诚部门多维表格 (绑定"同步今日成本到飞书"复选框)
+    if sync_feishu:
+        try:
+            from feishu_client import FeishuClient, load_credentials
+            from zhencheng_bitable import sync_zhencheng_costs
+
+            st.subheader(f"🔗 同步镶嵌成本到真诚多维表 ({len(items)} 件)")
+            with st.spinner("查询字段结构 + 逐条写入..."):
+                app_id, app_secret = load_credentials()
+                bitable_client = FeishuClient(app_id, app_secret)
+                sync_result = sync_zhencheng_costs(bitable_client, items)
+
+            st.success(
+                f"✅ 匹配 **{sync_result['matched']}** / 写入 **{sync_result['updated']}** "
+                f"| 证书字段=`{sync_result.get('cert_field') or '(无)'}` "
+                f"款号字段=`{sync_result.get('name_field') or '(无)'}` "
+                f"成本字段=`{sync_result['cost_field']}`"
+            )
+            if sync_result['not_found']:
+                st.warning(f"⚠️ {len(sync_result['not_found'])} 条没匹配到: "
+                           f"{', '.join(sync_result['not_found'][:10])}"
+                           + ("..." if len(sync_result['not_found']) > 10 else ""))
+            if sync_result['errors']:
+                st.error(f"❌ {len(sync_result['errors'])} 条报错:")
+                for err in sync_result['errors'][:5]:
+                    st.text(f"  {err}")
+
+            with st.expander("📋 每条详情"):
+                for d in sync_result['details']:
+                    ico = {'updated': '✅', 'would_update': '🔵', 'not_found': '⚠️',
+                           'error': '❌', 'skip': '⏭️'}.get(d.get('status'), '·')
+                    line = (f"{ico} #{d.get('no')} 证书={d.get('cert') or '空'} "
+                            f"客户={d.get('name') or '空'} status={d.get('status')}")
+                    if d.get('matched_by'):
+                        line += f" [{d['matched_by']}]"
+                    if d.get('cost') is not None:
+                        line += f" 成本={d['cost']}"
+                    if d.get('reason'):
+                        line += f" ({d['reason']})"
+                    st.text(line)
+        except Exception as e:
+            st.error(f"❌ 同步真诚多维表失败: {e}")
+            with st.expander("详细错误"):
+                st.code(traceback.format_exc())
+    else:
+        st.info(f"ℹ️ 有 {len(items)} 件可同步到真诚多维表 "
+                f"(勾选「✏️ 同步今日成本到飞书」后才写入)")
+
     return len(items)
 
 
@@ -382,7 +432,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                 except OSError: pass
                 st.stop()
             run_natural_workflow(in_path, uploaded.name, natural_factory, pt, au,
-                                 gia_months=GIA_MONTHS)
+                                 gia_months=GIA_MONTHS, sync_feishu=sync_feishu)
             try: os.unlink(in_path)
             except OSError: pass
             st.stop()
@@ -668,7 +718,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
             st.subheader("💎💎 猛哥双份 — 追加天然钻流程 (19楼真诚部门)")
             try:
                 run_natural_workflow(in_path, uploaded.name, '猛哥', pt, au,
-                                     gia_months=GIA_MONTHS)
+                                     gia_months=GIA_MONTHS, sync_feishu=sync_feishu)
             except Exception as e:
                 st.error(f"❌ 天然钻流程失败: {e}")
                 with st.expander("详细错误"):

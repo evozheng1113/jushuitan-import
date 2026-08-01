@@ -132,6 +132,15 @@ class FeishuClient:
                         return n
         return None
 
+    # ============ 元数据 ============
+    def list_fields(self, app_token, table_id):
+        """列出表的所有字段. 返回 [{field_name, type, ...}, ...]
+        用于运行时自适应字段名 (真诚多维表 v23 场景)."""
+        url = (f'https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}'
+               f'/tables/{table_id}/fields?page_size=100')
+        r = requests.get(url, headers=self._headers(), timeout=10)
+        return r.json().get('data', {}).get('items', []) or []
+
     # ============ 查询 ============
     def find_by_field(self, app_token, table_id, field_name, value):
         url = (f'https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}'
