@@ -81,12 +81,13 @@ else:
 uploaded = st.file_uploader(
     "选择工厂出货单 (.xlsx)",
     type=['xlsx'],
-    help="支持: 雅希(广州) / 倾诚(二厂) / 黛宝(三厂) / 猛哥(四厂)"
+    help="支持: 雅希(广州) / 倾诚(二厂) / 黛宝(三厂) / 猛哥(四厂) / 布心(天然钻)"
 )
 
 factory_label = st.selectbox(
     "工厂",
-    ["自动识别", "A 雅希 (广州)", "B 倾诚 (二厂)", "D 黛宝 (三厂)", "E 猛哥 (四厂)"],
+    ["自动识别", "A 雅希 (广州)", "B 倾诚 (二厂)", "D 黛宝 (三厂)",
+     "E 猛哥 (四厂)", "布心 (天然钻)"],
 )
 
 col3, col4 = st.columns(2)
@@ -404,6 +405,8 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                 st.error(f"❌ 文件名 `{uploaded.name}` 无法自动识别工厂，请上方手动选择")
                 os.unlink(in_path)
                 st.stop()
+        elif factory_label.startswith("布心"):
+            code = 'BUXIN'   # 布心走独立文件, 天然钻专属
         else:
             code = factory_label[0]
 
