@@ -405,6 +405,7 @@ def search_gia(client, order_sheets, kuanhao, cert_no):
         '散货行数': cost2_count,
         '主石额外行数': main_stone_extra_count,   # v20.3
         'attrs': attrs,
+        '客户名': real_c_name,   # v24.5: 从 GIA 表锁定到的真实客户名 (给 zhencheng_bitable sync 用)
         'debug': ';'.join(hits) if hits else '❌ 无匹配',
     }
 

@@ -72,6 +72,26 @@ except Exception as e:
 
 if feishu_ready:
     st.success("✓ 飞书已连接")
+    # v24.4: 真诚多维表结构诊断按钮
+    with st.expander("🔬 诊断真诚多维表结构 (点开查字段名 + 3 条样本)"):
+        if st.button("拉取真诚多维表字段 + 样本", key='probe_zc'):
+            try:
+                from zhencheng_bitable import probe_zhencheng_table
+                info = probe_zhencheng_table(_client, sample_size=3)
+                st.markdown(f"**字段列表** ({len(info['fields'])} 个):")
+                for f in info['fields']:
+                    st.text(f"  {f['name']:20s}  type={f['type']}  ui_type={f['ui_type']}")
+                st.markdown(f"**样本记录** ({len(info['samples'])} 条):")
+                if info.get('list_code') and info['list_code'] != 0:
+                    st.error(f"list records 失败: code={info['list_code']} msg={info.get('list_msg')}")
+                for i, s in enumerate(info['samples'], 1):
+                    st.markdown(f"— 样本 {i} record_id=`{s.get('record_id')}`")
+                    for k, v in (s.get('fields') or {}).items():
+                        st.text(f"    {k}: {repr(v)[:200]}")
+            except Exception as e:
+                st.error(f"诊断失败: {e}")
+                with st.expander("详细错误"):
+                    st.code(traceback.format_exc())
 else:
     st.error(f"❌ 飞书连接失败: {feishu_err}")
     st.info("如果是部署在 Streamlit Cloud → 右下角 ⋮ → Settings → Secrets, "
@@ -279,6 +299,11 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
     for i, it in enumerate(items):
         gia = natural.search_gia(gia_client, order_sheets, it['款号'], it['证书号'])
         it['_gia'] = gia
+        # v24.5: 把 GIA 表锁定到的真实客户名写回 item, 给 zhencheng_bitable sync 用
+        # (黛宝/布心/二厂工厂单里没客户名列, 必须靠 GIA 补; 猛哥有原生客户名也覆盖也无妨)
+        gia_cust = gia.get('客户名')
+        if gia_cust:
+            it['飞书客户名'] = gia_cust
         attrs = gia.get('attrs') or {}
         red_mark = ' 🔴多散货' if gia['散货行数'] >= 2 else ''
         hit_mark = '✓' if attrs.get('证书') else '✗'
@@ -366,6 +391,8 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
                            'error': '❌', 'skip': '⏭️'}.get(d.get('status'), '·')
                     line = (f"{ico} #{d.get('no')} 证书={d.get('cert') or '空'} "
                             f"客户={d.get('name') or '空'}")
+                    if d.get('matched_by'):
+                        line += f" 靠[{d['matched_by']}]命中"
                     if d.get('cost') is not None:
                         line += f" 成本={d['cost']}"
                     if d.get('profit') is not None:

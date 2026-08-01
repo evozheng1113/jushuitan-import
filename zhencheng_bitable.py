@@ -27,7 +27,7 @@ ZHENCHENG_TABLE_ID  = 'tblzKxchN598phDb'
 
 # ============ 字段名候选 (运行时自适应, 命中第一个就用) ============
 CERT_FIELD_CANDIDATES = ['证书编码', '证书编号', '证书号', '商品编码']
-NAME_FIELD_CANDIDATES = ['客户名', '客户名称', '客户', '下单单号', '款号']
+NAME_FIELD_CANDIDATES = ['客户名称', '客户名', '客户', '下单单号', '款号']  # v24.2 客户名称优先
 COST_FIELD_CANDIDATES = ['镶嵌成本', '成本2', '镶嵌费', '加工费', '镶工费', '工费']
 # v24.1: 回读用 (公式字段, 只读)
 PROFIT_FIELD_CANDIDATES = ['利润', '利润额', '毛利']
@@ -186,22 +186,25 @@ def sync_zhencheng_costs(client, items, dry_run=False):
     for it in items:
         cost = it.get('镶嵌成本')
         cert = str(it.get('证书号') or '').strip()
-        name = str(it.get('款号') or '').strip()
-        no   = it.get('no')
+        # v24.5: 客户名优先用 GIA 表锁定到的 (黛宝/布心/二厂工厂单没客户列, 靠 GIA 补)
+        #        兜底才用工厂单 B/C 列 (款号 - 猛哥这里就是客户名)
+        gia_cust = str(it.get('飞书客户名') or '').strip()
+        kh = str(it.get('款号') or '').strip()
+        no  = it.get('no')
 
         if not cost:
-            result['details'].append({'no': no, 'cert': cert, 'name': name,
+            result['details'].append({'no': no, 'cert': cert, 'name': gia_cust or kh,
                                        'status': 'skip', 'reason': '成本为空'})
             continue
-        if not (cert or name):
-            result['details'].append({'no': no, 'cert': cert, 'name': name,
-                                       'status': 'skip', 'reason': '证书 & 款号都空'})
+        if not (cert or gia_cust or kh):
+            result['details'].append({'no': no, 'cert': cert, 'name': '',
+                                       'status': 'skip', 'reason': '证书 & 客户名 & 款号都空'})
             continue
 
         rec = None
         matched_by = None
 
-        # 1. 证书号优先
+        # 1. 证书号优先 (每件唯一, 最强定位)
         if cert_field and cert:
             for cv in _cert_variants(cert):
                 try:
@@ -214,22 +217,33 @@ def sync_zhencheng_costs(client, items, dry_run=False):
                     rec, matched_by = r, f'{cert_field}={cv}'
                     break
 
-        # 2. 兜底: 款号 (客户名)
-        if not rec and name_field and name:
+        # 2. GIA 客户名 (从飞书 GIA 表锁定到的真实客户名)
+        if not rec and name_field and gia_cust:
             try:
                 r = client.find_by_field(ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID,
-                                          name_field, name)
+                                          name_field, gia_cust)
                 if r:
-                    rec, matched_by = r, f'{name_field}={name}'
+                    rec, matched_by = r, f'{name_field}(GIA)={gia_cust}'
             except Exception as e:
-                result['errors'].append(f"#{no} 款号查询 '{name}' 失败: {e}")
+                result['errors'].append(f"#{no} GIA客户名查询 '{gia_cust}' 失败: {e}")
 
+        # 3. 兜底: 工厂单款号 (猛哥 B 列本身就是客户名, 其他家可能是产品号会 miss)
+        if not rec and name_field and kh and kh != gia_cust:
+            try:
+                r = client.find_by_field(ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID,
+                                          name_field, kh)
+                if r:
+                    rec, matched_by = r, f'{name_field}(款号)={kh}'
+            except Exception as e:
+                result['errors'].append(f"#{no} 款号查询 '{kh}' 失败: {e}")
+
+        display_name = gia_cust or kh
         if not rec:
-            desc = f"cert={cert or '空'} name={name or '空'}"
+            desc = f"cert={cert or '空'} GIA客户={gia_cust or '空'} 款号={kh or '空'}"
             result['not_found'].append(desc)
-            result['details'].append({'no': no, 'cert': cert, 'name': name,
+            result['details'].append({'no': no, 'cert': cert, 'name': display_name,
                                        'status': 'not_found',
-                                       'reason': '证书 & 款号都没匹配到'})
+                                       'reason': f'GIA客户名={gia_cust or "无"} 款号={kh or "无"} 都没查到'})
             continue
 
         result['matched'] += 1
@@ -262,17 +276,39 @@ def sync_zhencheng_costs(client, items, dry_run=False):
                 elif rate > PROFIT_RATE_HIGH:
                     warn = f' 🟡利润率异常高({rate*100:.1f}%)'
 
-            result['details'].append({'no': no, 'cert': cert, 'name': name,
+            result['details'].append({'no': no, 'cert': cert, 'name': display_name,
                                        'status': 'updated',
                                        'matched_by': matched_by, 'cost': cost,
                                        'profit': profit, 'rate': rate,
                                        'note': note + warn})
         except Exception as e:
             result['errors'].append(f"#{no} 写入失败: {e}")
-            result['details'].append({'no': no, 'cert': cert, 'name': name,
+            result['details'].append({'no': no, 'cert': cert, 'name': display_name,
                                        'status': 'error', 'reason': str(e)})
 
     return result
+
+
+# ============ v24.4 网页诊断: 拉字段 + 前 3 条样本 ============
+def probe_zhencheng_table(client, sample_size=3):
+    """返回 dict: fields=[{name,type,ui_type}], samples=[{fields: {...}}]
+    UI 可以调用这个然后展示, 帮用户看清楚字段名和类型.
+    """
+    import requests
+    fields = client.list_fields(ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID)
+    field_summary = [
+        {'name': f.get('field_name'), 'type': f.get('type'),
+         'ui_type': f.get('ui_type')}
+        for f in fields
+    ]
+    # 拉 sample_size 条最近记录看数据形状
+    url = (f'https://open.feishu.cn/open-apis/bitable/v1/apps/{ZHENCHENG_APP_TOKEN}'
+           f'/tables/{ZHENCHENG_TABLE_ID}/records?page_size={sample_size}')
+    r = requests.get(url, headers=client._headers(), timeout=10)
+    data = r.json()
+    samples = data.get('data', {}).get('items', []) if data.get('code') == 0 else []
+    return {'fields': field_summary, 'samples': samples,
+            'list_code': data.get('code'), 'list_msg': data.get('msg')}
 
 
 # ============ CLI 探测 (调试用: 打印字段结构) ============
