@@ -843,6 +843,57 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                 with st.expander("详细错误"):
                     st.code(traceback.format_exc())
 
+        # v25: 培育钻文件里 类别='部门-真诚' 的件 → 真诚多维表 (跟天然钻真诚一起入19楼珠宝销售)
+        # 猛哥 A 列 = '19楼' 的行, factories.parse_E 会标 类别='部门-真诚'; B 列 = 真实客户名
+        if sync_feishu:
+            zc_pei_items = []
+            for it in items:
+                if it.get('类别') != '部门-真诚':
+                    continue
+                it2 = dict(it)
+                # factories 硬编码 飞书客户名='真诚' (假名), 用 B 列 单号 = 真实客户名覆盖
+                b_col = str(it.get('单号') or '').strip()
+                if b_col and b_col != '19楼':
+                    it2['飞书客户名'] = b_col
+                else:
+                    it2['飞书客户名'] = None   # 让 sync 走证书号
+                zc_pei_items.append(it2)
+
+            if zc_pei_items:
+                try:
+                    from zhencheng_bitable import sync_zhencheng_costs
+                    st.divider()
+                    st.subheader(f"🔗 真诚(19楼)培育件 → 真诚多维表 ({len(zc_pei_items)} 件)")
+                    with st.spinner("同步真诚培育件..."):
+                        zc_res = sync_zhencheng_costs(_client, zc_pei_items)
+                    st.success(
+                        f"✅ 匹配 **{zc_res['matched']}** / 写入 **{zc_res['updated']}** "
+                        f"| 证书=`{zc_res.get('cert_field') or '(无)'}` "
+                        f"客户名=`{zc_res.get('name_field') or '(无)'}` "
+                        f"成本=`{zc_res['cost_field']}`"
+                    )
+                    if zc_res['not_found']:
+                        st.warning(f"⚠️ {len(zc_res['not_found'])} 件没匹配到: "
+                                   f"{', '.join(zc_res['not_found'][:8])}")
+                    if zc_res['errors']:
+                        st.error(f"❌ {len(zc_res['errors'])} 件错误")
+                        for e in zc_res['errors'][:5]: st.text(f"  {e}")
+                    with st.expander("📋 每条详情 (真诚培育)", expanded=True):
+                        for d in zc_res['details']:
+                            ico = {'updated':'✅','not_found':'⚠️','error':'❌','skip':'⏭️'}.get(d.get('status'),'·')
+                            line = f"{ico} #{d.get('no')} 客户={d.get('name') or '空'}"
+                            if d.get('matched_by'): line += f" 靠[{d['matched_by']}]"
+                            if d.get('cost') is not None: line += f" 成本={d['cost']}"
+                            if d.get('profit') is not None: line += f" 利润={int(d['profit'])}"
+                            if d.get('rate') is not None: line += f" 利润率={d['rate']*100:.1f}%"
+                            if d.get('note'): line += d['note']
+                            if d.get('reason'): line += f" ({d['reason']})"
+                            st.text(line)
+                except Exception as e:
+                    st.error(f"❌ 同步真诚培育件失败: {e}")
+                    with st.expander("详细错误"):
+                        st.code(traceback.format_exc())
+
         # v20 + v22.9: 同步镶嵌成本到成品新单 (飞书电子表格) M 列
         # v22.9: 绑定 "✏️同步今日成本到飞书" 复选框, 不勾就不跑 (避免重复叠加)
         if sync_feishu:

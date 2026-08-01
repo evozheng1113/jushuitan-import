@@ -185,11 +185,11 @@ def sync_zhencheng_costs(client, items, dry_run=False):
     # ---- 逐条同步 ----
     for it in items:
         cost = it.get('镶嵌成本')
-        cert = str(it.get('证书号') or '').strip()
-        # v24.5: 客户名优先用 GIA 表锁定到的 (黛宝/布心/二厂工厂单没客户列, 靠 GIA 补)
-        #        兜底才用工厂单 B/C 列 (款号 - 猛哥这里就是客户名)
+        # v25: 字段名兼容两套 —— 天然钻(natural.py) '证书号/款号', 培育钻(factories.py) '证书编号/下单编号'
+        cert = str(it.get('证书号') or it.get('证书编号') or '').strip()
+        # 客户名优先用 GIA/飞书查到的 (培育钻已经预填过 飞书客户名), 兜底用款号/下单编号
         gia_cust = str(it.get('飞书客户名') or '').strip()
-        kh = str(it.get('款号') or '').strip()
+        kh = str(it.get('款号') or it.get('下单编号') or it.get('单号') or '').strip()
         no  = it.get('no')
 
         if not cost:
