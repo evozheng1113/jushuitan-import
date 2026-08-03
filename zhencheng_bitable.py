@@ -326,19 +326,29 @@ def sync_zhencheng_costs(client, items, dry_run=False):
             # 裸钻成本 (聚水潭 成本1) = gia['cost1']
             gia_info = it.get('_gia') or {}
             bare = gia_info.get('cost1')
-            if bare_cost_field and isinstance(bare, (int, float)) and bare > 0:
+            if not bare_cost_field:
+                if isinstance(bare, (int, float)) and bare > 0:
+                    filled_extras.append(f'裸钻(无字段,聚水潭={round(bare,2)})')
+            elif isinstance(bare, (int, float)) and bare > 0:
                 cur_bare = FeishuClient.get_number(existing.get(bare_cost_field))
-                if cur_bare in (None, 0):
+                if cur_bare is None or abs(cur_bare) < 0.01:
                     payload[bare_cost_field] = round(bare, 2)
                     filled_extras.append(f'裸钻={payload[bare_cost_field]}')
+                else:
+                    filled_extras.append(f'裸钻跳过(飞书已有={cur_bare})')
 
             # 配石成本 (聚水潭 成本2) = gia['cost2']
             side = gia_info.get('cost2')
-            if side_cost_field and isinstance(side, (int, float)) and side > 0:
+            if not side_cost_field:
+                if isinstance(side, (int, float)) and side > 0:
+                    filled_extras.append(f'配石(无字段,聚水潭={round(side,2)})')
+            elif isinstance(side, (int, float)) and side > 0:
                 cur_side = FeishuClient.get_number(existing.get(side_cost_field))
-                if cur_side in (None, 0):
+                if cur_side is None or abs(cur_side) < 0.01:
                     payload[side_cost_field] = round(side, 2)
                     filled_extras.append(f'配石={payload[side_cost_field]}')
+                else:
+                    filled_extras.append(f'配石跳过(飞书已有={cur_side})')
 
             client.update_record(ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID,
                                  rec_id, payload)
