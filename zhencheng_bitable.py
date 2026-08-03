@@ -33,8 +33,17 @@ COST_FIELD_CANDIDATES = ['镶嵌成本', '成本3', '镶嵌费', '加工费', '�
 PROFIT_FIELD_CANDIDATES = ['利润', '利润额', '毛利']
 RATE_FIELD_CANDIDATES   = ['利润率', '毛利率']
 # v27: 反向补空 (聚水潭 → 飞书, 只在飞书该字段空时才写)
-BARE_COST_CANDIDATES    = ['裸钻成本', '成本1', '裸石成本', '裸钻']       # 聚水潭 成本1
-SIDE_COST_CANDIDATES    = ['配石成本', '成本2', '散货成本', '副石成本']   # 聚水潭 成本2
+# v27.1: 用户业务表里 "裸钻成本" / "配石成本" 是公式字段, 真正可写的是 "XX 副本"
+# 候选里把可写副本放前面, 且 _pick_field 会跳过 type=20 (公式) 的字段
+BARE_COST_CANDIDATES    = ['裸钻成本 副本', '裸钻成本 副本2', '裸钻成本',
+                            '成本1', '裸石成本', '裸钻']
+SIDE_COST_CANDIDATES    = ['配石成本 副本', '配石成本 副本2', '配石成本',
+                            '成本2', '散货成本', '副石成本']
+
+# 飞书字段 type: 1=文本 2=数字 3=单选 4=多选 5=日期 7=复选框 11=人员
+# 15=超链 17=附件 18=单向关联 19=Lookup 20=公式 21=双向关联 22=地理位置 23=群组
+# 24=创建人 1005=创建时间 1006=修改时间 1004=修改人
+_READONLY_FIELD_TYPES = {19, 20}   # Lookup 和 Formula 都不能写
 
 
 # ============ 利润率阈值 (触发警示) ============
@@ -74,11 +83,18 @@ def _cert_variants(cert):
     return out
 
 
-def _pick_field(fields_meta, candidates):
-    names = {f.get('field_name', '').strip() for f in fields_meta}
+def _pick_field(fields_meta, candidates, exclude_readonly=False):
+    """按候选顺序找命中的字段名.
+    v27.1: exclude_readonly=True 时跳过公式/Lookup 字段 (写入类字段用).
+    """
+    lookup = {f.get('field_name', '').strip(): f for f in fields_meta}
     for c in candidates:
-        if c in names:
-            return c
+        f = lookup.get(c)
+        if not f:
+            continue
+        if exclude_readonly and f.get('type') in _READONLY_FIELD_TYPES:
+            continue
+        return c
     return None
 
 
@@ -174,9 +190,11 @@ def sync_zhencheng_costs(client, items, dry_run=False):
     if not fields_meta:
         raise RuntimeError("真诚多维表 list_fields 返回空, 检查 app_token/table_id/权限")
 
+    # cert / name 用于查询 (匹配), 可以是公式字段 (公式返回值也能作为 filter 依据)
     cert_field = _pick_field(fields_meta, CERT_FIELD_CANDIDATES)
     name_field = _pick_field(fields_meta, NAME_FIELD_CANDIDATES)
-    cost_field = _pick_field(fields_meta, COST_FIELD_CANDIDATES)
+    # cost 是写入类, 必须非只读
+    cost_field = _pick_field(fields_meta, COST_FIELD_CANDIDATES, exclude_readonly=True)
 
     all_names = [f.get('field_name', '') for f in fields_meta]
 
@@ -198,9 +216,9 @@ def sync_zhencheng_costs(client, items, dry_run=False):
     # v24.1: 回读用 (公式字段, 找不到不算错)
     profit_field = _pick_field(fields_meta, PROFIT_FIELD_CANDIDATES)
     rate_field   = _pick_field(fields_meta, RATE_FIELD_CANDIDATES)
-    # v27: 反向补空用 (聚水潭有值 + 飞书空 → 补写)
-    bare_cost_field = _pick_field(fields_meta, BARE_COST_CANDIDATES)
-    side_cost_field = _pick_field(fields_meta, SIDE_COST_CANDIDATES)
+    # v27: 反向补空用 (写入类, 排除公式/Lookup)
+    bare_cost_field = _pick_field(fields_meta, BARE_COST_CANDIDATES, exclude_readonly=True)
+    side_cost_field = _pick_field(fields_meta, SIDE_COST_CANDIDATES, exclude_readonly=True)
 
     result['cert_field'] = cert_field
     result['name_field'] = name_field
