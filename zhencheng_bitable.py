@@ -79,6 +79,25 @@ def _pick_field(fields_meta, candidates):
     return None
 
 
+def _name_variants(name):
+    """v26.1: 客户名可能是 '销售-客户' 或 '客户-销售' 或纯客户名 (布心场景).
+       生成所有候选: 原样 + 拆 '-' 后每一段.
+       多维表里存的通常是纯客户名, 所以拆分兜底能提升命中率.
+    """
+    if not name:
+        return []
+    s = str(name).strip()
+    if not s:
+        return []
+    out = [s]
+    if '-' in s:
+        for part in s.split('-'):
+            p = part.strip()
+            if p and p not in out and len(p) >= 2:  # 长度 <2 防误匹 (单字)
+                out.append(p)
+    return out
+
+
 def _get_record_by_id(client, app_token, table_id, record_id):
     """GET 单条记录 (用于轮询公式刷新)."""
     import requests
@@ -218,24 +237,31 @@ def sync_zhencheng_costs(client, items, dry_run=False):
                     break
 
         # 2. GIA 客户名 (从飞书 GIA 表锁定到的真实客户名)
+        # v26.1: 复合名 "销售-客户" 场景 → 用 variants 拆 - 每段都试
         if not rec and name_field and gia_cust:
-            try:
-                r = client.find_by_field(ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID,
-                                          name_field, gia_cust)
+            for nv in _name_variants(gia_cust):
+                try:
+                    r = client.find_by_field(ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID,
+                                              name_field, nv)
+                except Exception as e:
+                    result['errors'].append(f"#{no} GIA客户名 '{nv}' 查询失败: {e}")
+                    continue
                 if r:
-                    rec, matched_by = r, f'{name_field}(GIA)={gia_cust}'
-            except Exception as e:
-                result['errors'].append(f"#{no} GIA客户名查询 '{gia_cust}' 失败: {e}")
+                    rec, matched_by = r, f'{name_field}(GIA)={nv}'
+                    break
 
-        # 3. 兜底: 工厂单款号 (猛哥 B 列本身就是客户名, 其他家可能是产品号会 miss)
+        # 3. 兜底: 工厂单款号 (猛哥 B 列本身就是客户名; 布心 B 列也可能是"销售-客户")
         if not rec and name_field and kh and kh != gia_cust:
-            try:
-                r = client.find_by_field(ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID,
-                                          name_field, kh)
+            for nv in _name_variants(kh):
+                try:
+                    r = client.find_by_field(ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID,
+                                              name_field, nv)
+                except Exception as e:
+                    result['errors'].append(f"#{no} 款号 '{nv}' 查询失败: {e}")
+                    continue
                 if r:
-                    rec, matched_by = r, f'{name_field}(款号)={kh}'
-            except Exception as e:
-                result['errors'].append(f"#{no} 款号查询 '{kh}' 失败: {e}")
+                    rec, matched_by = r, f'{name_field}(款号)={nv}'
+                    break
 
         display_name = gia_cust or kh
         if not rec:
