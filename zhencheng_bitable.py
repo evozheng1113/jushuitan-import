@@ -28,10 +28,13 @@ ZHENCHENG_TABLE_ID  = 'tblzKxchN598phDb'
 # ============ 字段名候选 (运行时自适应, 命中第一个就用) ============
 CERT_FIELD_CANDIDATES = ['证书编码', '证书编号', '证书号', '商品编码']
 NAME_FIELD_CANDIDATES = ['客户名称', '客户名', '客户', '下单单号', '款号']  # v24.2 客户名称优先
-COST_FIELD_CANDIDATES = ['镶嵌成本', '成本2', '镶嵌费', '加工费', '镶工费', '工费']
+COST_FIELD_CANDIDATES = ['镶嵌成本', '成本3', '镶嵌费', '加工费', '镶工费', '工费']  # v27: 镶嵌 = 聚水潭成本3
 # v24.1: 回读用 (公式字段, 只读)
 PROFIT_FIELD_CANDIDATES = ['利润', '利润额', '毛利']
 RATE_FIELD_CANDIDATES   = ['利润率', '毛利率']
+# v27: 反向补空 (聚水潭 → 飞书, 只在飞书该字段空时才写)
+BARE_COST_CANDIDATES    = ['裸钻成本', '成本1', '裸石成本', '裸钻']       # 聚水潭 成本1
+SIDE_COST_CANDIDATES    = ['配石成本', '成本2', '散货成本', '副石成本']   # 聚水潭 成本2
 
 
 # ============ 利润率阈值 (触发警示) ============
@@ -162,6 +165,7 @@ def sync_zhencheng_costs(client, items, dry_run=False):
         'not_found': [], 'errors': [],
         'cert_field': None, 'name_field': None, 'cost_field': None,
         'profit_field': None, 'rate_field': None,   # v24.1
+        'bare_cost_field': None, 'side_cost_field': None,   # v27
         'details': [], 'dry_run': dry_run,
     }
 
@@ -194,12 +198,17 @@ def sync_zhencheng_costs(client, items, dry_run=False):
     # v24.1: 回读用 (公式字段, 找不到不算错)
     profit_field = _pick_field(fields_meta, PROFIT_FIELD_CANDIDATES)
     rate_field   = _pick_field(fields_meta, RATE_FIELD_CANDIDATES)
+    # v27: 反向补空用 (聚水潭有值 + 飞书空 → 补写)
+    bare_cost_field = _pick_field(fields_meta, BARE_COST_CANDIDATES)
+    side_cost_field = _pick_field(fields_meta, SIDE_COST_CANDIDATES)
 
     result['cert_field'] = cert_field
     result['name_field'] = name_field
     result['cost_field'] = cost_field
     result['profit_field'] = profit_field
     result['rate_field']   = rate_field
+    result['bare_cost_field'] = bare_cost_field
+    result['side_cost_field'] = side_cost_field
 
     # ---- 逐条同步 ----
     for it in items:
@@ -283,8 +292,38 @@ def sync_zhencheng_costs(client, items, dry_run=False):
             continue
 
         try:
+            # v27: 反向补空 — 聚水潭有值 + 飞书该字段空 → 补写 (证书号/裸钻/配石)
+            # 先取匹配到的 rec 里现有 fields, 判断哪些空
+            existing = rec.get('fields', {}) or {}
+            payload = {cost_field: cost}   # 镶嵌成本永远覆盖
+            filled_extras = []
+
+            # 证书号: it['证书号'] → 用 _norm_code 归一化 (跟聚水潭商品编码同格式)
+            if cert_field and cert:
+                cur_cert = FeishuClient.get_text(existing.get(cert_field))
+                if not cur_cert or not str(cur_cert).strip():
+                    payload[cert_field] = _norm_code(cert) or cert
+                    filled_extras.append(f'证书={payload[cert_field]}')
+
+            # 裸钻成本 (聚水潭 成本1) = gia['cost1']
+            gia_info = it.get('_gia') or {}
+            bare = gia_info.get('cost1')
+            if bare_cost_field and isinstance(bare, (int, float)) and bare > 0:
+                cur_bare = FeishuClient.get_number(existing.get(bare_cost_field))
+                if cur_bare in (None, 0):
+                    payload[bare_cost_field] = round(bare, 2)
+                    filled_extras.append(f'裸钻={payload[bare_cost_field]}')
+
+            # 配石成本 (聚水潭 成本2) = gia['cost2']
+            side = gia_info.get('cost2')
+            if side_cost_field and isinstance(side, (int, float)) and side > 0:
+                cur_side = FeishuClient.get_number(existing.get(side_cost_field))
+                if cur_side in (None, 0):
+                    payload[side_cost_field] = round(side, 2)
+                    filled_extras.append(f'配石={payload[side_cost_field]}')
+
             client.update_record(ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID,
-                                 rec_id, {cost_field: cost})
+                                 rec_id, payload)
             result['updated'] += 1
 
             # v24.1: 轮询等公式刷新, 回读利润/利润率写回 item
@@ -302,11 +341,12 @@ def sync_zhencheng_costs(client, items, dry_run=False):
                 elif rate > PROFIT_RATE_HIGH:
                     warn = f' 🟡利润率异常高({rate*100:.1f}%)'
 
+            extras_str = (' 补:' + '/'.join(filled_extras)) if filled_extras else ''
             result['details'].append({'no': no, 'cert': cert, 'name': display_name,
                                        'status': 'updated',
                                        'matched_by': matched_by, 'cost': cost,
                                        'profit': profit, 'rate': rate,
-                                       'note': note + warn})
+                                       'note': note + warn + extras_str})
         except Exception as e:
             result['errors'].append(f"#{no} 写入失败: {e}")
             result['details'].append({'no': no, 'cert': cert, 'name': display_name,

@@ -372,7 +372,9 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
                 f"✅ 匹配 **{sync_result['matched']}** / 写入 **{sync_result['updated']}** "
                 f"| 证书=`{sync_result.get('cert_field') or '(无)'}` "
                 f"款号=`{sync_result.get('name_field') or '(无)'}` "
-                f"成本=`{sync_result['cost_field']}` "
+                f"镶嵌=`{sync_result['cost_field']}` "
+                f"裸钻=`{sync_result.get('bare_cost_field') or '(无)'}` "
+                f"配石=`{sync_result.get('side_cost_field') or '(无)'}` "
                 f"利润=`{sync_result.get('profit_field') or '(无)'}` "
                 f"利润率=`{sync_result.get('rate_field') or '(无)'}`"
             )
