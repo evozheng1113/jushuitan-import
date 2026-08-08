@@ -362,11 +362,13 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
             from feishu_client import FeishuClient, load_credentials
             from zhencheng_bitable import sync_zhencheng_costs
 
-            st.subheader(f"🔗 同步镶嵌成本到真诚多维表 ({len(items)} 件)")
+            # v28: 只同步"客户单"到真诚多维表, 现货 (E-ZC-*) 走真诚成品新单 sheet
+            bitable_items = [it for it in items if it.get('类别') != '部门-真诚-现货']
+            st.subheader(f"🔗 同步镶嵌成本到真诚多维表 ({len(bitable_items)} 件客户单)")
             with st.spinner("查询字段结构 + 逐条写入 + 轮询等公式..."):
                 app_id, app_secret = load_credentials()
                 bitable_client = FeishuClient(app_id, app_secret)
-                sync_result = sync_zhencheng_costs(bitable_client, items)
+                sync_result = sync_zhencheng_costs(bitable_client, bitable_items)
 
             st.success(
                 f"✅ 匹配 **{sync_result['matched']}** / 写入 **{sync_result['updated']}** "
@@ -493,6 +495,60 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
             st.error(f"❌ 同步真诚多维表失败: {e}")
             with st.expander("详细错误"):
                 st.code(traceback.format_exc())
+
+        # v28: 真诚现货 (E-ZC-*) → 真诚成品新单 sheet (跟培育钻现货同逻辑, 目标 sheet 不同)
+        spot_items = [it for it in items if it.get('类别') == '部门-真诚-现货']
+        if spot_items:
+            try:
+                from finished_products import FinishedProductsClient, sync_costs
+                st.divider()
+                st.subheader(f"🔗 真诚现货 (E-ZC-*) → 真诚成品新单 ({len(spot_items)} 件)")
+
+                # 探测 sheet_id: 优先"真诚成品新单", 兜底"真诚成品"
+                probe_client = FinishedProductsClient(app_id, app_secret)
+                zc_sheet_id = None
+                for sheet_name in ('真诚成品新单', '真诚成品', '真诚成品新单表'):
+                    try:
+                        zc_sheet_id = probe_client.find_sheet_id_by_name(sheet_name)
+                        if zc_sheet_id:
+                            st.caption(f"命中 sheet: `{sheet_name}` (sheet_id=`{zc_sheet_id}`)")
+                            break
+                    except RuntimeError as re_e:
+                        # 最后一次没命中, 抛出让下面异常处理; 中间没命中就继续
+                        if sheet_name == '真诚成品新单表':
+                            raise
+                        continue
+
+                if zc_sheet_id:
+                    # 用探测到的 sheet_id 创建 client
+                    zc_client = FinishedProductsClient(app_id, app_secret, sheet_id=zc_sheet_id)
+                    # 构造 sync_items: match_key = 款号 (E-ZC-*), cost = 镶嵌成本, name = 品名
+                    sync_items = [
+                        {'match_key': str(it.get('款号')).strip(),
+                         'cost': it.get('镶嵌成本'),
+                         'name': f"#{it.get('no')} {it.get('品名', '')}"}
+                        for it in spot_items
+                        if it.get('款号') and it.get('镶嵌成本')
+                    ]
+                    with st.spinner("匹配 sheet 单元格 → 叠加写入 M 列..."):
+                        zc_res = sync_costs(zc_client, sync_items)
+                    st.success(f"✅ 匹配 **{len(zc_res['matched'])}** 条 / 提交 {len(sync_items)} 条")
+                    if zc_res['unmatched']:
+                        st.warning(f"⚠️ {len(zc_res['unmatched'])} 条没匹配到: "
+                                   f"{', '.join(zc_res['unmatched'][:10])}"
+                                   + ("..." if len(zc_res['unmatched']) > 10 else ""))
+                    if zc_res['errors']:
+                        st.error(f"❌ {len(zc_res['errors'])} 条错误")
+                        for e_ in zc_res['errors'][:5]: st.text(f"  {e_}")
+                    with st.expander("📋 每条命中详情 (真诚现货)"):
+                        for m in zc_res['matched'][:50]:
+                            st.text(f"✅ 行 {m['row']}: key={m['match_key']} "
+                                    f"M {m['old_m']} + {m['add_cost']} = {m['new_m']}"
+                                    + (f"  H '{m['old_h']}' → '{m['new_h']}'" if m.get('new_h') else ''))
+            except Exception as e:
+                st.error(f"❌ 同步真诚现货到真诚成品新单失败: {e}")
+                with st.expander("详细错误"):
+                    st.code(traceback.format_exc())
     else:
         st.info(f"ℹ️ 有 {len(items)} 件可同步到真诚多维表 "
                 f"(勾选「✏️ 同步今日成本到飞书」后才写入)")

@@ -594,9 +594,16 @@ def parse_menggou(xlsx_path, au_price, pt_price):
         a_str = str(a or '').strip()
         b_str = str(b or '').strip()
 
-        # 只处理真诚部门客订
+        # 只处理真诚部门 (v28: 现在也识别真诚现货 E-ZC-*)
         if a_str != '19楼': continue    # 不是真诚部门 → 培育部门老流程管
-        if not b_str: continue          # 真诚现货 → 跳过
+        if not b_str: continue          # B 空 → 跳过
+
+        # v28: 类别判定 —— B 匹配 [字母]-ZC-* 为真诚现货 (跟 E-XH-* 培育现货同性质)
+        #                否则视为真诚客户单 (B = 客户名)
+        if re.match(r'^[A-Za-z]-ZC-', b_str):
+            _category = '部门-真诚-现货'
+        else:
+            _category = '部门-真诚-客户单'
 
         material = str(ws.cell(row=r, column=5).value or '').strip()  # E 成色
         ring = ws.cell(row=r, column=6).value           # F 手寸
@@ -664,7 +671,7 @@ def parse_menggou(xlsx_path, au_price, pt_price):
         no += 1
         items.append({
             'no': no, 'row': r,
-            '款号': b_str,                          # 客户名
+            '款号': b_str,                          # 客户名 (客户单) 或 单号 (现货)
             '证书号': str(c_val or '').strip(),      # C 编码
             '条码号': '',
             '品名': str(d or '').strip(),
@@ -675,6 +682,7 @@ def parse_menggou(xlsx_path, au_price, pt_price):
             '主石重量_ct': main_w_ct if main_w_ct > 0 else None,
             '副石重量_合计': side_w_ct if side_w_ct > 0 else None,
             '镶嵌成本': cost,
+            '类别': _category,                       # v28: 部门-真诚-现货 / 部门-真诚-客户单
             '_折足金': zhe_zu,
             '_金价': gp,
             '_金值': jin_zhi,

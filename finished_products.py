@@ -59,6 +59,21 @@ class FinishedProductsClient:
             h['Content-Type'] = 'application/json'
         return h
 
+    def find_sheet_id_by_name(self, sheet_name):
+        """v28: 按 sheet 显示名探测 sheet_id (电子表格里可能有多个 sheet)."""
+        r = requests.get(
+            f'{FEISHU_BASE}/sheets/v3/spreadsheets/{self.spreadsheet_token}/sheets/query',
+            headers=self._headers(), timeout=10)
+        data = r.json()
+        if data.get('code') != 0:
+            raise RuntimeError(f"list sheets 失败: code={data.get('code')} msg={data.get('msg')}")
+        for s in data.get('data', {}).get('sheets', []) or []:
+            if s.get('title', '').strip() == sheet_name.strip():
+                return s.get('sheet_id')
+        # 找不到 → 列出所有 sheet 名给出错误
+        titles = [s.get('title') for s in data.get('data', {}).get('sheets', []) or []]
+        raise RuntimeError(f"没找到 sheet {sheet_name!r}. 表里现有 sheets: {titles}")
+
     def load_all_rows(self, max_col='AZ', max_row=2000):
         """拉全 sheet (A1:AZ2000, 覆盖 M/P 列足够), 返回二维数组"""
         rng = f'{self.sheet_id}!A1:{max_col}{max_row}'
