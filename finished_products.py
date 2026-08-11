@@ -111,17 +111,37 @@ class FinishedProductsClient:
         return self.batch_write([(r, 'M', v) for r, v in updates])
 
 
+def _detect_cost_col(header_row):
+    """v28.1: 动态探测成本列位 (0-based).
+    扫表头找 '¥' / '镶嵌成本' / '成本' / '总额' 字样, 命中即返回.
+    找不到返回 12 (M 列, 老培育钻成品新单默认).
+    """
+    for i, cell in enumerate(header_row):
+        s = str(cell or '').strip()
+        if not s:
+            continue
+        if s == '¥' or '镶嵌成本' in s or '镶嵌' in s:
+            return i
+    # 兜底: 找"成本" (可能"成本1/成本2"混淆, 所以放后面) 或"总额"
+    for i, cell in enumerate(header_row):
+        s = str(cell or '').strip()
+        if '成本' in s or '总额' in s:
+            return i
+    return COL_M   # 兜底 M 列 (培育钻成品新单老逻辑)
+
+
 def sync_costs(fp_client, items):
-    """把 items 列表里的镶嵌成本同步到成品新单 M 列 (叠加).
+    """把 items 列表里的镶嵌成本同步到成品新单 (叠加).
+    v28.1: 目标列位动态探测 (培育钻成品新单在 M 列, 真诚成品新单在 L 列).
 
     items: [{'match_key': 'B-XH-7-6-1', 'cost': 3140, 'name': '#1 LOOP项链'}, ...]
 
     匹配规则:
-        - 成品新单 P 列 (第 16 列) 值 == match_key → 命中
-        - 命中后读 M 列原值 (0 fallback), 加上 cost, 写回
+        - sheet 每行扫全部单元格找 match_key (v22.5)
+        - 命中后读探测到的成本列原值 (0 fallback), 加上 cost, 写回
 
     返回 {
-        'matched': [{'name', 'match_key', 'row', 'old_m', 'add_cost', 'new_m'}, ...],
+        'matched': [{'name', 'match_key', 'row', 'old_m', 'add_cost', 'new_m', 'cost_col_letter'}, ...],
         'unmatched': ['B-XH-7-6-99', ...],
         'errors': [...],
         'response': 飞书返回,
@@ -135,6 +155,11 @@ def sync_costs(fp_client, items):
             'errors': [f'成品新单为空或只有表头 (拉到 {len(rows)} 行)'],
             'response': None,
         }
+
+    # v28.1: 动态探测成本列位
+    cost_col_idx = _detect_cost_col(rows[0])
+    from openpyxl.utils import get_column_letter as _colL
+    cost_col_letter = _colL(cost_col_idx + 1)
 
     # v22.10: 队列消费 (支持同 key 多条: 广州1行=N件拆成 N 条同 key)
     #         猛哥场景不受影响, 因为 parse_E 已在解析层合并 rows+cost 相加,
@@ -186,10 +211,10 @@ def sync_costs(fp_client, items):
 
         # v22.10: 队列消费 (每次匹配 pop 一个, 同 key 多条时按顺序各消费一次)
         it = key_queue[matched_key].popleft()
-        # 读 M 列原值
+        # 读探测到的成本列原值 (v28.1: cost_col_idx 动态)
         old_m = 0
-        if len(row) > COL_M:
-            raw = row[COL_M]
+        if len(row) > cost_col_idx:
+            raw = row[cost_col_idx]
             if raw not in (None, ''):
                 try:
                     old_m = float(raw)
@@ -197,7 +222,7 @@ def sync_costs(fp_client, items):
                     old_m = 0
         cost = it.get('cost') or 0
         new_m = math.ceil(old_m + cost)
-        updates.append((row_idx, 'M', new_m))
+        updates.append((row_idx, cost_col_letter, new_m))
 
         # v20.1: H 列 "某某厂待出货" → "某某厂" (去掉"待出货")
         old_h = ''
@@ -218,6 +243,7 @@ def sync_costs(fp_client, items):
             'old_m': math.ceil(old_m),
             'add_cost': math.ceil(cost),
             'new_m': new_m,
+            'cost_col_letter': cost_col_letter,   # v28.1: 探测到的目标列
             'old_h': old_h,
             'new_h': new_h,
         })

@@ -540,10 +540,11 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
                     if zc_res['errors']:
                         st.error(f"❌ {len(zc_res['errors'])} 条错误")
                         for e_ in zc_res['errors'][:5]: st.text(f"  {e_}")
-                    with st.expander("📋 每条命中详情 (真诚现货)"):
+                    with st.expander("📋 每条命中详情 (真诚现货)", expanded=True):
                         for m in zc_res['matched'][:50]:
+                            col = m.get('cost_col_letter', 'M')
                             st.text(f"✅ 行 {m['row']}: key={m['match_key']} "
-                                    f"M {m['old_m']} + {m['add_cost']} = {m['new_m']}"
+                                    f"{col} {m['old_m']} + {m['add_cost']} = {m['new_m']}"
                                     + (f"  H '{m['old_h']}' → '{m['new_h']}'" if m.get('new_h') else ''))
             except Exception as e:
                 st.error(f"❌ 同步真诚现货到真诚成品新单失败: {e}")
