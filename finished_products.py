@@ -111,34 +111,17 @@ class FinishedProductsClient:
         return self.batch_write([(r, 'M', v) for r, v in updates])
 
 
-def _detect_cost_col(header_row):
-    """v28.1: 动态探测成本列位 (0-based).
-    扫表头找 '¥' / '镶嵌成本' / '成本' / '总额' 字样, 命中即返回.
-    找不到返回 12 (M 列, 老培育钻成品新单默认).
-    """
-    for i, cell in enumerate(header_row):
-        s = str(cell or '').strip()
-        if not s:
-            continue
-        if s == '¥' or '镶嵌成本' in s or '镶嵌' in s:
-            return i
-    # 兜底: 找"成本" (可能"成本1/成本2"混淆, 所以放后面) 或"总额"
-    for i, cell in enumerate(header_row):
-        s = str(cell or '').strip()
-        if '成本' in s or '总额' in s:
-            return i
-    return COL_M   # 兜底 M 列 (培育钻成品新单老逻辑)
-
-
-def sync_costs(fp_client, items):
+def sync_costs(fp_client, items, cost_col_letter='M'):
     """把 items 列表里的镶嵌成本同步到成品新单 (叠加).
-    v28.1: 目标列位动态探测 (培育钻成品新单在 M 列, 真诚成品新单在 L 列).
+    v28.1 撤销 → v28.1a: 恢复默认 M 列 (培育钻成品新单历史约定), 通过参数覆盖.
+    - 培育钻成品新单调用: sync_costs(...)  → 默认 M 列 (不变)
+    - 真诚成品新单调用:   sync_costs(..., cost_col_letter='L')
 
     items: [{'match_key': 'B-XH-7-6-1', 'cost': 3140, 'name': '#1 LOOP项链'}, ...]
 
     匹配规则:
         - sheet 每行扫全部单元格找 match_key (v22.5)
-        - 命中后读探测到的成本列原值 (0 fallback), 加上 cost, 写回
+        - 命中后读 cost_col_letter 原值 (0 fallback), 加上 cost, 写回
 
     返回 {
         'matched': [{'name', 'match_key', 'row', 'old_m', 'add_cost', 'new_m', 'cost_col_letter'}, ...],
@@ -156,10 +139,9 @@ def sync_costs(fp_client, items):
             'response': None,
         }
 
-    # v28.1: 动态探测成本列位
-    cost_col_idx = _detect_cost_col(rows[0])
-    from openpyxl.utils import get_column_letter as _colL
-    cost_col_letter = _colL(cost_col_idx + 1)
+    # v28.1a: 从参数拿列位 (不动态探测, 避免误伤成品新单老逻辑)
+    from openpyxl.utils import column_index_from_string as _colI
+    cost_col_idx = _colI(cost_col_letter) - 1
 
     # v22.10: 队列消费 (支持同 key 多条: 广州1行=N件拆成 N 条同 key)
     #         猛哥场景不受影响, 因为 parse_E 已在解析层合并 rows+cost 相加,

@@ -530,8 +530,8 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
                         for it in spot_items
                         if it.get('款号') and it.get('镶嵌成本')
                     ]
-                    with st.spinner("匹配 sheet 单元格 → 叠加写入 M 列..."):
-                        zc_res = sync_costs(zc_client, sync_items)
+                    with st.spinner("匹配 sheet 单元格 → 叠加写入 L 列 (真诚成品新单)..."):
+                        zc_res = sync_costs(zc_client, sync_items, cost_col_letter='L')
                     st.success(f"✅ 匹配 **{len(zc_res['matched'])}** 条 / 提交 {len(sync_items)} 条")
                     if zc_res['unmatched']:
                         st.warning(f"⚠️ {len(zc_res['unmatched'])} 条没匹配到: "
