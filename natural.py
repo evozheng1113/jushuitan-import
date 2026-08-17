@@ -847,8 +847,10 @@ def build_jst_row(it, gia, factory_name):
         '荧光': attrs.get('荧光'),
         '直径大小': None,
         '商品编码': _norm_code(it['证书号']) if it.get('证书号') else (it.get('条码号') or None),
-        '成本1': round(cost1, 2) if cost1 > 0 else None,
-        '成本2': round(cost2, 2) if cost2 > 0 else None,
+        # v28.2: 猛哥场景, cost1/cost2 找不到时填 0 (结料件, 无裸钻/无散货是常态)
+        # 其他厂 (黛宝/布心/二厂), None 保持空 → 让用户人工补
+        '成本1': (round(cost1, 2) if cost1 > 0 else (0 if factory_name == '猛哥' else None)),
+        '成本2': (round(cost2, 2) if cost2 > 0 else (0 if factory_name == '猛哥' else None)),
         '成本3': round(cost3, 2) if cost3 > 0 else None,
         '成本价': round(total, 2) if total > 0 else None,
         '指圈号': it['手寸'],

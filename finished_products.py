@@ -263,6 +263,45 @@ def _split_multi(s):
     return [p.strip() for p in parts if p and p.strip()]
 
 
+_XH_NUM_MATCH = _re_fp.compile(r'^([A-Za-z]-XH-.+-)(\d+)$')
+
+
+def _expand_xh_range(tokens):
+    """v29: 广州工厂单 C 列用 '至' 分隔起止 XH 单号 (换行拆后是 [起, '至', 止]).
+       展开成中间所有序号. 例:
+         ['A-XH-8-11-11', '至', 'A-XH-8-11-20']
+         → ['A-XH-8-11-11', 'A-XH-8-11-12', ..., 'A-XH-8-11-20']  (10 条)
+       无 '至' 则原样返回 (只保留 XH 行).
+    """
+    if '至' not in tokens:
+        return [t for t in tokens if t and _re_fp.search(r'[A-Za-z]-XH-', t)]
+
+    result = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        # 找 [XH起, '至', XH止] 三元组
+        if (t and _XH_NUM_MATCH.match(t)
+                and i + 2 < len(tokens)
+                and tokens[i + 1] == '至'
+                and _XH_NUM_MATCH.match(tokens[i + 2])):
+            m1 = _XH_NUM_MATCH.match(t)
+            m2 = _XH_NUM_MATCH.match(tokens[i + 2])
+            # 前缀必须相同 (如 'A-XH-8-11-')
+            if m1.group(1) == m2.group(1):
+                n1, n2 = int(m1.group(2)), int(m2.group(2))
+                if n1 <= n2:
+                    for n in range(n1, n2 + 1):
+                        result.append(f'{m1.group(1)}{n}')
+                    i += 3
+                    continue
+        # 不是范围三元组 → 单个 XH 加进去, 其他 (含 '至' 单独) 跳过
+        if t and _re_fp.search(r'[A-Za-z]-XH-', t):
+            result.append(t)
+        i += 1
+    return result
+
+
 def _strip_cert_prefix(s):
     """v22.8: 去证书号前缀 (工厂单常带 IGI/GIA/LG, 成品新单只存数字部分).
        例: 'IGI807626332' → '807626332'
@@ -300,10 +339,8 @@ def build_sync_items_from_factory_items(factory_items):
         invoice = it.get('单号') or ''
 
         # 优先 1: C 列拆出所有 A-XH-*/B-XH-*/D-XH-*/E-XH-* 类的单号
-        keys = []
-        for line in _split_multi(order):
-            if _re_fp.search(r'[A-Za-z]-XH-', line):
-                keys.append(line)
+        # v29: 支持 "A-XH-8-11-11 至 A-XH-8-11-20" 范围表达 → 展开中间 10 个
+        keys = _expand_xh_range(_split_multi(order))
 
         # 优先 2: 若 C 列没有 XH, 从 E 列拆多证书号 (如两只戒指 2 个 IGI)
         # v22.8: 去 IGI/GIA/LG 前缀 (成品新单只存数字部分, 如 807626332-2)

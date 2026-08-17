@@ -33,12 +33,20 @@ COST_FIELD_CANDIDATES = ['镶嵌成本', '成本3', '镶嵌费', '加工费', '�
 PROFIT_FIELD_CANDIDATES = ['利润', '利润额', '毛利']
 RATE_FIELD_CANDIDATES   = ['利润率', '毛利率']
 # v27: 反向补空 (聚水潭 → 飞书, 只在飞书该字段空时才写)
-# v27.1: 用户业务表里 "裸钻成本" / "配石成本" 是公式字段, 真正可写的是 "XX 副本"
-# 候选里把可写副本放前面, 且 _pick_field 会跳过 type=20 (公式) 的字段
-BARE_COST_CANDIDATES    = ['裸钻成本 副本', '裸钻成本 副本2', '裸钻成本',
-                            '成本1', '裸石成本', '裸钻']
-SIDE_COST_CANDIDATES    = ['配石成本 副本', '配石成本 副本2', '配石成本',
-                            '成本2', '散货成本', '副石成本']
+# v27.3: 候选支持 tuple (关键字组, 全含即命中) 应对 "裸钻成本 副本 2" 这种全角/多空格变体
+#       str 精确匹配 优先; tuple 模糊匹配 兜底; 全部跟 exclude_readonly 组合排除公式
+BARE_COST_CANDIDATES    = [
+    ('裸钻', '副本'),          # 模糊: 裸钻成本 副本 / 裸钻成本 副本2 / 裸钻成本副本 都命中
+    '裸钻成本 副本', '裸钻成本 副本2',
+    '裸钻成本',
+    '成本1', '裸石成本', '裸钻',
+]
+SIDE_COST_CANDIDATES    = [
+    ('配石', '副本'),          # 模糊: 配石成本 副本 等
+    '配石成本 副本', '配石成本 副本2',
+    '配石成本',
+    '成本2', '散货成本', '副石成本',
+]
 
 # 飞书字段 type: 1=文本 2=数字 3=单选 4=多选 5=日期 7=复选框 11=人员
 # 15=超链 17=附件 18=单向关联 19=Lookup 20=公式 21=双向关联 22=地理位置 23=群组
@@ -86,15 +94,26 @@ def _cert_variants(cert):
 def _pick_field(fields_meta, candidates, exclude_readonly=False):
     """按候选顺序找命中的字段名.
     v27.1: exclude_readonly=True 时跳过公式/Lookup 字段 (写入类字段用).
+    v27.3: candidate 可以是 str (精确匹配) 或 tuple/list (关键字组, 名字含所有关键字即命中).
     """
     lookup = {f.get('field_name', '').strip(): f for f in fields_meta}
     for c in candidates:
-        f = lookup.get(c)
-        if not f:
-            continue
-        if exclude_readonly and f.get('type') in _READONLY_FIELD_TYPES:
-            continue
-        return c
+        if isinstance(c, str):
+            f = lookup.get(c)
+            if not f:
+                continue
+            if exclude_readonly and f.get('type') in _READONLY_FIELD_TYPES:
+                continue
+            return c
+        elif isinstance(c, (tuple, list)):
+            # 模糊: 字段名含所有关键字即命中 (按 fields_meta 顺序取第一个)
+            for f in fields_meta:
+                name = f.get('field_name', '').strip()
+                if not name or not all(kw in name for kw in c):
+                    continue
+                if exclude_readonly and f.get('type') in _READONLY_FIELD_TYPES:
+                    continue
+                return name
     return None
 
 
@@ -245,6 +264,12 @@ def sync_zhencheng_costs(client, items, dry_run=False):
         if not (cert or gia_cust or kh):
             result['details'].append({'no': no, 'cert': cert, 'name': '',
                                        'status': 'skip', 'reason': '证书 & 客户名 & 款号都空'})
+            continue
+        # v29.1: 占位符件 (款号='真诚'/[待填]/占位符 且 无证书 无 GIA 客户名) → skip 不报警
+        PLACEHOLDER = ('真诚', '[待填]', '待填', '占位', 'X', 'x', '-', '—')
+        if not cert and not gia_cust and kh in PLACEHOLDER:
+            result['details'].append({'no': no, 'cert': cert, 'name': kh,
+                                       'status': 'skip', 'reason': f'占位符件({kh}) - 无证书 无 GIA 客户名'})
             continue
 
         rec = None
