@@ -243,13 +243,38 @@ def _row_get_cost(row, layout):
     return 0
 
 
+_CERT_PREFIX_RE = re.compile(r'^\s*(GIA|IGI|LG)\s*', re.IGNORECASE)
+
+
+def _normalize_cert(s):
+    """v29.2: 归一化证书号 (GIA 库存 vs 工厂单证书号 常有格式差异):
+       - 数字类型 → str 后带 '.0' 尾 (openpyxl float 转换) → 去掉
+       - 'GIA 811642944' / 'IGI 811' → 去前缀 + 去空格
+       - 前后空格 / 多空格 → 归一
+    """
+    if s is None:
+        return ''
+    s = str(s).strip()
+    if not s:
+        return ''
+    # 处理 Excel float 转 str 的 '.0' 尾 (811642944.0 → 811642944)
+    if s.endswith('.0') and s[:-2].isdigit():
+        s = s[:-2]
+    # 去 GIA/IGI/LG 前缀 + 前缀后可能的空格
+    s = _CERT_PREFIX_RE.sub('', s).strip()
+    return s
+
+
 def _row_get_cert_no(row, layout):
+    """v29.2: 返回归一化后的证书号 (去 .0 尾, 去 GIA/IGI/LG 前缀, 去空格)."""
     for k in ('商品编码', '证书编号'):
         idx = layout.get(k)
         if idx is not None:
             v = _cell(row, idx)
             if v is not None:
-                return str(v).strip()
+                norm = _normalize_cert(v)
+                if norm:
+                    return norm
     return ''
 
 
@@ -334,9 +359,15 @@ def search_gia(client, order_sheets, kuanhao, cert_no):
     cert_variants = []
     if cert_no_str:
         cert_variants.append(cert_no_str)
-        # 工厂号带 LG 前缀 → 也试去掉 LG (库存可能存无 LG 版)
+        # v29.2: 归一化版本 (去 GIA/IGI/LG 前缀 + .0 尾) — 应对库存表存 float / 带前缀
+        norm = _normalize_cert(cert_no_str)
+        if norm and norm not in cert_variants:
+            cert_variants.append(norm)
+        # 兜底: 老逻辑 (只去 LG)
         if cert_no_str.upper().startswith('LG'):
-            cert_variants.append(cert_no_str[2:].lstrip('_-').strip())
+            legacy = cert_no_str[2:].lstrip('_-').strip()
+            if legacy and legacy not in cert_variants:
+                cert_variants.append(legacy)
 
     # ---------- Step 1: 证书号锁定唯一主石行 ----------
     if cert_variants:
