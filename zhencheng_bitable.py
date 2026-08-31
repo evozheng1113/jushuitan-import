@@ -117,10 +117,18 @@ def _pick_field(fields_meta, candidates, exclude_readonly=False):
     return None
 
 
+_CN_PREFIX_RE = re.compile(r'^[一-龥]+')
+
+
 def _name_variants(name):
-    """v26.1: 客户名可能是 '销售-客户' 或 '客户-销售' 或纯客户名 (布心场景).
-       生成所有候选: 原样 + 拆 '-' 后每一段.
-       多维表里存的通常是纯客户名, 所以拆分兜底能提升命中率.
+    """v26.1 + v29.3: 生成客户名候选 (多维表通常存纯客户名):
+       - 原样 (万一存全名)
+       - 拆 '-' 每一段
+       - 每段的"中文前缀" (去日期 8.22 / 尾数字 之类)
+       例:
+         '曾开心8.22--肖金林' → ['曾开心8.22--肖金林', '曾开心8.22', '曾开心', '肖金林']
+         '罗燕婷8.26-2--张晓婷' → ['罗燕婷8.26-2--张晓婷', '罗燕婷8.26', '罗燕婷', '张晓婷']
+         '谢小姐' → ['谢小姐']
     """
     if not name:
         return []
@@ -128,11 +136,20 @@ def _name_variants(name):
     if not s:
         return []
     out = [s]
-    if '-' in s:
-        for part in s.split('-'):
-            p = part.strip()
-            if p and p not in out and len(p) >= 2:  # 长度 <2 防误匹 (单字)
-                out.append(p)
+
+    def _push(p):
+        p = (p or '').strip()
+        if p and p not in out and len(p) >= 2:
+            out.append(p)
+
+    # 先按 - 拆
+    parts = s.split('-') if '-' in s else [s]
+    for part in parts:
+        _push(part)
+        # v29.3: 提取中文前缀 (去日期/数字尾巴, 保留纯中文名)
+        m = _CN_PREFIX_RE.match(part.strip())
+        if m:
+            _push(m.group(0))
     return out
 
 
