@@ -266,8 +266,12 @@ def _normalize_cert(s):
 
 
 def _row_get_cert_no(row, layout):
-    """v29.2: 返回归一化后的证书号 (去 .0 尾, 去 GIA/IGI/LG 前缀, 去空格)."""
-    for k in ('商品编码', '证书编号'):
+    """v29.4: 证书编号优先, 商品编码兜底.
+       GIA 库存表 C 列=商品编码=内部号 (如 2609067), P 列=证书编号=真实 GIA 号 (如 2176121298);
+       之前顺序反了会先命中内部号 → miss 匹配, 现在证书编号优先.
+       v29.2: 归一化 (去 .0 尾, 去 GIA/IGI/LG 前缀, 去空格).
+    """
+    for k in ('证书编号', '证书号', '商品编码'):
         idx = layout.get(k)
         if idx is not None:
             v = _cell(row, idx)
