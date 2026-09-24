@@ -146,13 +146,15 @@ def sync_costs(fp_client, items, cost_col_letter='M'):
     # v22.10: 队列消费 (支持同 key 多条: 广州1行=N件拆成 N 条同 key)
     #         猛哥场景不受影响, 因为 parse_E 已在解析层合并 rows+cost 相加,
     #         build_sync_items 生成的是 1 条 sync_item (队列 1 条)
+    # v29.5: match_key 归一化多横杠 (工厂单 'E-ZC-9--19-21' 双横杠 vs sheet 单横杠)
     from collections import deque
     key_queue = {}   # match_key → deque of items
     for it in items:
-        k = str(it.get('match_key') or '').strip()
+        k = _re_fp.sub(r'-+', '-', str(it.get('match_key') or '').strip())
         if not k:
             continue
-        key_queue.setdefault(k, deque()).append(dict(it))
+        it2 = dict(it); it2['match_key'] = k
+        key_queue.setdefault(k, deque()).append(it2)
 
     updates = []       # [(row_idx, col_letter, value)]
     match_log = []
@@ -177,13 +179,15 @@ def sync_costs(fp_client, items, cost_col_letter='M'):
 
         # v22.5: 每行扫全部单元格, 自动识别哪一列存了匹配键
         #        条件: 值含 '-' 且长度 >=5 (排除成本数字、单一字符等)
+        # v29.5: sheet 里可能也有双横杠 → 归一化后再匹配
         matched_key = None
         matched_p_val = None
         for cell in row:
             s = str(cell or '').strip()
             if len(s) < 5 or '-' not in s:
                 continue
-            k = _find_matching_key(s)
+            s_norm = _re_fp.sub(r'-+', '-', s)
+            k = _find_matching_key(s_norm)
             if k:
                 matched_key = k
                 matched_p_val = s
