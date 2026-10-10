@@ -115,7 +115,7 @@ def sync_costs(fp_client, items, cost_col_letter='M'):
     """把 items 列表里的镶嵌成本同步到成品新单 (叠加).
     v28.1 撤销 → v28.1a: 恢复默认 M 列 (培育钻成品新单历史约定), 通过参数覆盖.
     - 培育钻成品新单调用: sync_costs(...)  → 默认 M 列 (不变)
-    - 真诚成品新单调用:   sync_costs(..., cost_col_letter='L')
+    - 真诚成品新单调用:   sync_costs(..., cost_col_letter='M')，叠加写入成本2；L 列钻石成本不修改
 
     items: [{'match_key': 'B-XH-7-6-1', 'cost': 3140, 'name': '#1 LOOP项链'}, ...]
 
