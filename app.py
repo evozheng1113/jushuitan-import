@@ -249,6 +249,8 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
     with st.spinner(f"解析 {factory_name} 天然钻单..."):
         try:
             items = parser(in_path, au_price=au, pt_price=pt)
+            for item in items:
+                item['_工厂'] = factory_name
         except Exception as e:
             st.error(f"❌ 解析失败: {e}")
             with st.expander("详细错误"):
@@ -910,6 +912,8 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                 if it.get('类别') != '部门-真诚':
                     continue
                 it2 = dict(it)
+                if code == 'E':
+                    it2['_工厂'] = '猛哥'
                 # factories 硬编码 飞书客户名='真诚' (假名), 用 B 列 单号 = 真实客户名覆盖
                 b_col = str(it.get('单号') or '').strip()
                 if b_col and b_col != '19楼':

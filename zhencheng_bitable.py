@@ -4,7 +4,9 @@
   聚水潭里 `商品编码 = natural._norm_code(证书号)` (去多杠, 补 -1 后缀).
   真诚多维表就是聚水潭上游的数据表, 记录的证书 & 客户名 = 同一批客户.
 
-匹配优先级 (证书优先, 每件唯一; 款号=客户名会重复所以兜底):
+猛哥客户单先按完整“下单单号”精确匹配，数字简写允许补 ZC-E-；
+命中多条时停止该条写入。姓名日期/数字单号不拆成客户名模糊兜底。
+其余匹配优先级 (证书优先, 每件唯一; 款号=客户名会重复所以兜底):
   1. 证书号 → 生成 4 种 variants 依次试 (原样 / -1 后缀 / 去 IGI-GIA-LG 前缀 / 去前缀+-1)
   2. 找不到 → 用款号 (客户名) 兜底
   3. 都失败 → 记 not_found
@@ -28,6 +30,7 @@ ZHENCHENG_TABLE_ID  = 'tblzKxchN598phDb'
 # ============ 字段名候选 (运行时自适应, 命中第一个就用) ============
 CERT_FIELD_CANDIDATES = ['证书编码', '证书编号', '证书号', '商品编码']
 NAME_FIELD_CANDIDATES = ['客户名称', '客户名', '客户', '下单单号', '款号']  # v24.2 客户名称优先
+ORDER_FIELD_CANDIDATES = ['下单单号']
 COST_FIELD_CANDIDATES = ['镶嵌成本', '成本3', '镶嵌费', '加工费', '镶工费', '工费']  # v27: 镶嵌 = 聚水潭成本3
 # v24.1: 回读用 (公式字段, 只读)
 PROFIT_FIELD_CANDIDATES = ['利润', '利润额', '毛利']
@@ -153,6 +156,52 @@ def _name_variants(name):
     return out
 
 
+def _mengge_order_variants(order):
+    """保留完整下单单号；数字简写仅补 ZC-E-，不改日期/尾号。"""
+    s = str(order or '').strip()
+    if not s or re.match(r'^[A-Za-z]-(?:ZC|XH)-', s, re.I):
+        return []  # 现货编号不当成客户单
+    variants = [s]
+    if re.fullmatch(r'\d{1,2}-\d{1,2}-\d+', s):
+        variants.append('ZC-E-' + s)
+    return variants
+
+
+def _looks_like_order(order):
+    s = str(order or '').strip()
+    return bool(re.fullmatch(r'(?:ZC-E-)?\d{1,2}-\d{1,2}-\d+', s)
+                or re.search(r'\d{1,2}[./月]\d{1,2}', s))
+
+
+def _find_unique_order(client, field, variants):
+    """独立查询下单单号，多个候选必须共同指向唯一记录。"""
+    import requests
+    records = {}
+    for value in variants:
+        url = (f'https://open.feishu.cn/open-apis/bitable/v1/apps/{ZHENCHENG_APP_TOKEN}'
+               f'/tables/{ZHENCHENG_TABLE_ID}/records/search')
+        response = requests.post(url, headers=client._headers(), json={
+            'filter': {'conjunction': 'and', 'conditions': [{
+                'field_name': field, 'operator': 'is', 'value': [value],
+            }]},
+        }, timeout=10)
+        data = response.json()
+        if data.get('code') != 0:
+            raise RuntimeError(f"下单单号查询失败: {data.get('code')} {data.get('msg')}")
+        page = data.get('data') or {}
+        found = page.get('items') or []
+        if page.get('has_more') or len(found) > 1:
+            raise RuntimeError(f'下单单号 {value!r} 命中多条记录，需人工核对')
+        for record in found:
+            rid = record.get('record_id')
+            if not rid:
+                raise RuntimeError('下单单号查询结果缺少 record_id')
+            records[rid] = (record, f'{field}={value}')
+    if len(records) > 1:
+        raise RuntimeError('原单号与补前缀单号命中不同记录，需人工核对')
+    return next(iter(records.values()), (None, None))
+
+
 def _get_record_by_id(client, app_token, table_id, record_id):
     """GET 单条记录 (用于轮询公式刷新)."""
     import requests
@@ -229,6 +278,7 @@ def sync_zhencheng_costs(client, items, dry_run=False):
     # cert / name 用于查询 (匹配), 可以是公式字段 (公式返回值也能作为 filter 依据)
     cert_field = _pick_field(fields_meta, CERT_FIELD_CANDIDATES)
     name_field = _pick_field(fields_meta, NAME_FIELD_CANDIDATES)
+    order_field = _pick_field(fields_meta, ORDER_FIELD_CANDIDATES)
     # cost 是写入类, 必须非只读
     cost_field = _pick_field(fields_meta, COST_FIELD_CANDIDATES, exclude_readonly=True)
 
@@ -240,7 +290,7 @@ def sync_zhencheng_costs(client, items, dry_run=False):
             f"表实际字段: {all_names}\n"
             f"→ 请把真实字段名加进 zhencheng_bitable.COST_FIELD_CANDIDATES"
         )
-    if not (cert_field or name_field):
+    if not (cert_field or name_field or order_field):
         raise RuntimeError(
             f"没找到匹配字段 (证书 or 款号).\n"
             f"证书候选: {CERT_FIELD_CANDIDATES}\n"
@@ -258,6 +308,7 @@ def sync_zhencheng_costs(client, items, dry_run=False):
 
     result['cert_field'] = cert_field
     result['name_field'] = name_field
+    result['order_field'] = order_field
     result['cost_field'] = cost_field
     result['profit_field'] = profit_field
     result['rate_field']   = rate_field
@@ -291,9 +342,20 @@ def sync_zhencheng_costs(client, items, dry_run=False):
 
         rec = None
         matched_by = None
+        is_mengge = it.get('_工厂') == '猛哥'
+        explicit_order = is_mengge and _looks_like_order(kh)
+        if is_mengge and order_field:
+            try:
+                rec, matched_by = _find_unique_order(
+                    client, order_field, _mengge_order_variants(kh))
+            except Exception as e:
+                result['errors'].append(f'#{no} {kh}: {e}')
+                result['details'].append({'no': no, 'cert': cert, 'name': kh,
+                                           'status': 'error', 'reason': str(e)})
+                continue
 
-        # 1. 证书号优先 (每件唯一, 最强定位)
-        if cert_field and cert:
+        # 1. 证书号 (猛哥先查下单单号，其他工厂保持证书优先)
+        if not rec and cert_field and cert:
             for cv in _cert_variants(cert):
                 try:
                     r = client.find_by_field(ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID,
@@ -307,7 +369,7 @@ def sync_zhencheng_costs(client, items, dry_run=False):
 
         # 2. GIA 客户名 (从飞书 GIA 表锁定到的真实客户名)
         # v26.1: 复合名 "销售-客户" 场景 → 用 variants 拆 - 每段都试
-        if not rec and name_field and gia_cust:
+        if not rec and not explicit_order and name_field and gia_cust:
             for nv in _name_variants(gia_cust):
                 try:
                     r = client.find_by_field(ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID,
@@ -320,7 +382,7 @@ def sync_zhencheng_costs(client, items, dry_run=False):
                     break
 
         # 3. 兜底: 工厂单款号 (猛哥 B 列本身就是客户名; 布心 B 列也可能是"销售-客户")
-        if not rec and name_field and kh and kh != gia_cust:
+        if not rec and not explicit_order and name_field and kh and kh != gia_cust:
             for nv in _name_variants(kh):
                 try:
                     r = client.find_by_field(ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID,
@@ -338,14 +400,16 @@ def sync_zhencheng_costs(client, items, dry_run=False):
             result['not_found'].append(desc)
             result['details'].append({'no': no, 'cert': cert, 'name': display_name,
                                        'status': 'not_found',
-                                       'reason': f'GIA客户名={gia_cust or "无"} 款号={kh or "无"} 都没查到'})
+                                       'reason': (f'下单单号={kh} 未匹配（含允许的前缀候选），证书也未命中'
+                                                  if explicit_order else
+                                                  f'GIA客户名={gia_cust or "无"} 款号={kh or "无"} 都没查到')})
             continue
 
         result['matched'] += 1
         rec_id = rec.get('record_id')
 
         if dry_run:
-            result['details'].append({'no': no, 'cert': cert, 'name': name,
+            result['details'].append({'no': no, 'cert': cert, 'name': display_name,
                                        'status': 'would_update',
                                        'matched_by': matched_by,
                                        'record_id': rec_id, 'cost': cost})
