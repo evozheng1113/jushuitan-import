@@ -838,7 +838,9 @@ def parse_E(excel_path, pt_price, au_price, sheet_name=None, default_material=No
         invoice_s = str(invoice or '').strip()
         normalized = _normalize_order(invoice_s)
 
-        if no == '19楼' or invoice_s == '19楼':
+        if re.match(r'^E-ZC-.+$', invoice_s, re.IGNORECASE):
+            cat, fly_key, customer = '部门-真诚-现货', invoice_s, '真诚现货'
+        elif no == '19楼' or invoice_s == '19楼':
             cat, fly_key = '部门-真诚', None
             # v26: B 列 (invoice_s) 是真实客户名 (如 'KCS#'), 优先用它;
             # 只有 B 也是"19楼"或空时兜底 '真诚'. 影响: 完成文件客户名列 & 真诚多维表同步都拿到真名

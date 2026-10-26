@@ -332,6 +332,10 @@ def build_sync_items_from_factory_items(factory_items):
     SPOT_LIKE = ('现货', '部门-真诚')
     sync_items = []
     for it in factory_items:
+        # 真诚现货只由专门入口同步，禁止落入培育成品新单。
+        if any(_re_fp.match(r'^E-ZC-', str(it.get(k) or '').strip(), _re_fp.I)
+               for k in ('单号', '款号', '下单编号', '飞书匹配键')):
+            continue
         if it.get('类别') not in SPOT_LIKE:
             continue
         cost = it.get('镶嵌成本')

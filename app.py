@@ -237,9 +237,55 @@ def get_gia_client():
     return natural.FeishuSheetClient(app_id, app_secret)
 
 
+def sync_zhencheng_finished_items(items):
+    spot_items = [it for it in items if it.get('类别') == '部门-真诚-现货']
+    if spot_items:
+        try:
+            from finished_products import FinishedProductsClient, sync_costs
+            app_id, app_secret = load_credentials()
+            st.divider()
+            st.subheader(f"🔗 真诚现货 (E-ZC-*) → 真诚成品新单 ({len(spot_items)} 件)")
+
+            # 只匹配指定工作表，不回退到培育“成品新单”。
+            probe_client = FinishedProductsClient(app_id, app_secret)
+            zc_sheet_id = probe_client.find_sheet_id_by_name('真诚成品新单')
+            st.caption(f"命中 sheet: 真诚成品新单 (sheet_id=`{zc_sheet_id}`)")
+
+            if zc_sheet_id:
+                # 用探测到的 sheet_id 创建 client
+                zc_client = FinishedProductsClient(app_id, app_secret, sheet_id=zc_sheet_id)
+                # 构造 sync_items: match_key = 款号 (E-ZC-*), cost = 镶嵌成本, name = 品名
+                sync_items = [
+                    {'match_key': str(it.get('款号') or it.get('单号')).strip(),
+                     'cost': it.get('镶嵌成本'),
+                     'name': f"#{it.get('no')} {it.get('品名', '')}"}
+                    for it in spot_items
+                    if (it.get('款号') or it.get('单号')) and it.get('镶嵌成本')
+                ]
+                with st.spinner("匹配 sheet 单元格 → 叠加写入 M 列成本2 (真诚成品新单)..."):
+                    zc_res = sync_costs(zc_client, sync_items, cost_col_letter='M')
+                st.success(f"✅ 匹配 **{len(zc_res['matched'])}** 条 / 提交 {len(sync_items)} 条")
+                if zc_res['unmatched']:
+                    st.warning(f"⚠️ {len(zc_res['unmatched'])} 条没匹配到: "
+                               f"{', '.join(zc_res['unmatched'][:10])}"
+                               + ("..." if len(zc_res['unmatched']) > 10 else ""))
+                if zc_res['errors']:
+                    st.error(f"❌ {len(zc_res['errors'])} 条错误")
+                    for e_ in zc_res['errors'][:5]: st.text(f"  {e_}")
+                with st.expander("📋 每条命中详情 (真诚现货)", expanded=True):
+                    for m in zc_res['matched'][:50]:
+                        col = m.get('cost_col_letter', 'M')
+                        st.text(f"✅ 行 {m['row']}: key={m['match_key']} "
+                                f"{col} {m['old_m']} + {m['add_cost']} = {m['new_m']}"
+                                + (f"  H '{m['old_h']}' → '{m['new_h']}'" if m.get('new_h') else ''))
+        except Exception as e:
+            st.error(f"❌ 同步真诚现货到真诚成品新单失败: {e}")
+            with st.expander("详细错误"):
+                st.code(traceback.format_exc())
+
 # ---------------- 天然钻流程 (共用: 黛宝 / 布心 / 猛哥 / 二厂) ----------------
 def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_months=6,
-                          sync_feishu=False):
+                          sync_feishu=False, sync_zc_spots=True):
     """
     跑一次天然钻流程: 解析 → 查 GIA → 生成聚水潭 xlsx + 下载按钮.
     factory_name: natural.PARSERS 的键 ('黛宝'/'布心'/'猛哥'/'二厂')
@@ -498,60 +544,9 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
             with st.expander("详细错误"):
                 st.code(traceback.format_exc())
 
-        # v28: 真诚现货 (E-ZC-*) → 真诚成品新单 sheet (跟培育钻现货同逻辑, 目标 sheet 不同)
-        spot_items = [it for it in items if it.get('类别') == '部门-真诚-现货']
-        if spot_items:
-            try:
-                from finished_products import FinishedProductsClient, sync_costs
-                st.divider()
-                st.subheader(f"🔗 真诚现货 (E-ZC-*) → 真诚成品新单 ({len(spot_items)} 件)")
+        if sync_zc_spots:
+            sync_zhencheng_finished_items(items)
 
-                # 探测 sheet_id: 优先"真诚成品新单", 兜底"真诚成品"
-                probe_client = FinishedProductsClient(app_id, app_secret)
-                zc_sheet_id = None
-                for sheet_name in ('真诚成品新单', '真诚成品', '真诚成品新单表'):
-                    try:
-                        zc_sheet_id = probe_client.find_sheet_id_by_name(sheet_name)
-                        if zc_sheet_id:
-                            st.caption(f"命中 sheet: `{sheet_name}` (sheet_id=`{zc_sheet_id}`)")
-                            break
-                    except RuntimeError as re_e:
-                        # 最后一次没命中, 抛出让下面异常处理; 中间没命中就继续
-                        if sheet_name == '真诚成品新单表':
-                            raise
-                        continue
-
-                if zc_sheet_id:
-                    # 用探测到的 sheet_id 创建 client
-                    zc_client = FinishedProductsClient(app_id, app_secret, sheet_id=zc_sheet_id)
-                    # 构造 sync_items: match_key = 款号 (E-ZC-*), cost = 镶嵌成本, name = 品名
-                    sync_items = [
-                        {'match_key': str(it.get('款号')).strip(),
-                         'cost': it.get('镶嵌成本'),
-                         'name': f"#{it.get('no')} {it.get('品名', '')}"}
-                        for it in spot_items
-                        if it.get('款号') and it.get('镶嵌成本')
-                    ]
-                    with st.spinner("匹配 sheet 单元格 → 叠加写入 M 列成本2 (真诚成品新单)..."):
-                        zc_res = sync_costs(zc_client, sync_items, cost_col_letter='M')
-                    st.success(f"✅ 匹配 **{len(zc_res['matched'])}** 条 / 提交 {len(sync_items)} 条")
-                    if zc_res['unmatched']:
-                        st.warning(f"⚠️ {len(zc_res['unmatched'])} 条没匹配到: "
-                                   f"{', '.join(zc_res['unmatched'][:10])}"
-                                   + ("..." if len(zc_res['unmatched']) > 10 else ""))
-                    if zc_res['errors']:
-                        st.error(f"❌ {len(zc_res['errors'])} 条错误")
-                        for e_ in zc_res['errors'][:5]: st.text(f"  {e_}")
-                    with st.expander("📋 每条命中详情 (真诚现货)", expanded=True):
-                        for m in zc_res['matched'][:50]:
-                            col = m.get('cost_col_letter', 'M')
-                            st.text(f"✅ 行 {m['row']}: key={m['match_key']} "
-                                    f"{col} {m['old_m']} + {m['add_cost']} = {m['new_m']}"
-                                    + (f"  H '{m['old_h']}' → '{m['new_h']}'" if m.get('new_h') else ''))
-            except Exception as e:
-                st.error(f"❌ 同步真诚现货到真诚成品新单失败: {e}")
-                with st.expander("详细错误"):
-                    st.code(traceback.format_exc())
     else:
         st.info(f"ℹ️ 有 {len(items)} 件可同步到真诚多维表 "
                 f"(勾选「✏️ 同步今日成本到飞书」后才写入)")
@@ -626,10 +621,18 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
             items = factories.get_parser(code)(in_path, **parse_kwargs)
 
         clients = [it for it in items if it['类别'] == '客户单']
-        spots = [it for it in items if it['类别'] == '现货']
+        spots = [it for it in items if it['类别'] in ('现货', '部门-真诚-现货')]
         repairs = [it for it in items if it['类别'] == '修理']
 
         st.success(f"✓ 解析 {len(items)} 件 — 客户单 {len(clients)} | 现货 {len(spots)} | 修理 {len(repairs)}")
+
+        # E-ZC-* 由主解析器直接分流，不依赖文件名或序号栏写“19楼”。
+        zc_spots = [it for it in items if it['类别'] == '部门-真诚-现货']
+        if zc_spots:
+            if sync_feishu:
+                sync_zhencheng_finished_items(zc_spots)
+            else:
+                st.info(f"ℹ️ {len(zc_spots)} 件真诚现货 → 真诚成品新单 M 列（未勾选同步，不写入）")
 
         # ============== v15: 飞书查询 + 同步 (有客户单自动查) ==============
         feishu_hit = 0
@@ -898,7 +901,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
             st.subheader("💎💎 猛哥双份 — 追加天然钻流程 (19楼真诚部门)")
             try:
                 run_natural_workflow(in_path, uploaded.name, '猛哥', pt, au,
-                                     gia_months=GIA_MONTHS, sync_feishu=sync_feishu)
+                                     gia_months=GIA_MONTHS, sync_feishu=sync_feishu, sync_zc_spots=False)
             except Exception as e:
                 st.error(f"❌ 天然钻流程失败: {e}")
                 with st.expander("详细错误"):
