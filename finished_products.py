@@ -111,8 +111,8 @@ class FinishedProductsClient:
         return self.batch_write([(r, 'M', v) for r, v in updates])
 
 
-def sync_costs(fp_client, items, cost_col_letter='M'):
-    """把 items 列表里的镶嵌成本同步到成品新单 (叠加).
+def sync_costs(fp_client, items, cost_col_letter='M', overwrite=False):
+    """同步到成品新单；默认叠加，overwrite=True 时直接替换目标成本。
     v28.1 撤销 → v28.1a: 恢复默认 M 列 (培育钻成品新单历史约定), 通过参数覆盖.
     - 培育钻成品新单调用: sync_costs(...)  → 默认 M 列 (不变)
     - 真诚成品新单调用:   sync_costs(..., cost_col_letter='M')，叠加写入成本2；L 列钻石成本不修改
@@ -207,7 +207,7 @@ def sync_costs(fp_client, items, cost_col_letter='M'):
                 except (ValueError, TypeError):
                     old_m = 0
         cost = it.get('cost') or 0
-        new_m = math.ceil(old_m + cost)
+        new_m = math.ceil(cost if overwrite else old_m + cost)
         updates.append((row_idx, cost_col_letter, new_m))
 
         # v20.1: H 列 "某某厂待出货" → "某某厂" (去掉"待出货")

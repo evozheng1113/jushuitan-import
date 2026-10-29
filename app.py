@@ -26,7 +26,7 @@ st.set_page_config(page_title="聚水潭入库生成", page_icon="💎", layout=
 
 st.title("💎 聚水潭入库 Excel 生成")
 st.caption("上传出货单 → 核对金价 → 生成文件或同步成本")
-st.caption("版本：2026.10.29 · 布心 / 黛宝更新")
+st.caption("版本：2026.10.29.2")
 
 # ---------------- 飞书工具 ----------------
 def _fetch_after_update(client, key, target_cost, max_wait=4):
@@ -105,6 +105,32 @@ uploaded = st.file_uploader(
     help="支持: 雅希(广州) / 倾诚(二厂) / 黛宝(三厂) / 猛哥(四厂) / 布心(天然钻)"
 )
 
+# 文件历史与成本成功状态分开；记录失败不当成首次上传。
+if uploaded and feishu_ready:
+    upload_key = hashlib.sha256(uploaded.getvalue()).hexdigest()
+    upload_cache = st.session_state.setdefault('_upload_checks', {})
+    if upload_key not in upload_cache:
+        try:
+            from upload_registry import check_and_record
+            from finished_products import FinishedProductsClient
+            upload_id, upload_secret = load_credentials()
+            upload_client = FinishedProductsClient(upload_id, upload_secret)
+            upload_cache[upload_key] = check_and_record(upload_client, uploaded.getvalue(), uploaded.name)
+        except Exception:
+            upload_cache[upload_key] = {'unknown': True}
+    upload_info = upload_cache[upload_key]
+    if upload_info.get('unknown'):
+        st.warning("暂时无法核对上传记录，请勿据此判断是否重复。")
+        if st.button("重查上传记录"):
+            upload_cache.pop(upload_key, None)
+            st.rerun()
+    elif upload_info.get('generated'):
+        st.info("已加载过、已跑过（已生成过结果）。可重新生成结果文件；如需重写成本，请勾选同步和覆盖。")
+    elif upload_info.get('seen'):
+        st.warning("已加载过，尚无结果生成记录。可以继续处理。")
+    else:
+        st.caption("未找到这份表格的历史上传记录。")
+
 factory_label = st.selectbox(
     "工厂",
     ["自动识别", "A 雅希 (广州)", "B 倾诚 (二厂)", "D 黛宝 (三厂)",
@@ -147,9 +173,8 @@ with col_b:
 overwrite = False
 debug_mode = False
 if sync_feishu:
-    st.caption("真诚客户单更新镶嵌成本；真诚现货叠加到 M 列成本2。")
-    with st.expander("高级设置"):
-        overwrite = st.checkbox("培育成本覆盖模式", value=False)
+    overwrite = st.checkbox("覆盖模式 (不叠加, 直接覆盖)", value=False)
+    with st.expander("诊断设置"):
         debug_mode = st.checkbox("显示诊断信息", value=False)
 
 buxin_initial = {'PT950': False, '18K': False}
@@ -158,6 +183,22 @@ if uploaded and sync_feishu and ('ZC' in uploaded.name.upper() or '布心' in fa
         st.caption("仅在首次接入遇到已有成本时使用。分别确认本文件最后一批是否尚未同步；不确定就不勾选。以后自动跳过已同步出货。")
         buxin_initial['PT950'] = st.checkbox("确认 PT 最后一批尚未同步，允许更新已有成本", key='buxin_pt_' + hashlib.sha256(uploaded.getvalue()).hexdigest())
         buxin_initial['18K'] = st.checkbox("确认 18K 最后一批尚未同步，允许更新已有成本", key='buxin_18k_' + hashlib.sha256(uploaded.getvalue()).hexdigest())
+
+
+def remember_generated():
+    """仅在结果文件生成后记录；不标记飞书成本已成功同步。"""
+    if not uploaded or not feishu_ready:
+        return
+    info = st.session_state.get('_upload_checks', {}).get(upload_key, {})
+    if not info or info.get('unknown') or info.get('generated'):
+        return
+    try:
+        from upload_registry import record_generated
+        from finished_products import FinishedProductsClient
+        log_id, log_secret = load_credentials()
+        record_generated(FinishedProductsClient(log_id, log_secret), info, uploaded.name)
+    except Exception:
+        st.caption("结果已生成，但运行记录暂未保存。")
 
 
 # ---------------- 工厂识别 ----------------
@@ -257,8 +298,8 @@ def sync_zhencheng_finished_items(items):
                     for it in spot_items
                     if (it.get('款号') or it.get('单号')) and it.get('镶嵌成本')
                 ]
-                with st.spinner("匹配 sheet 单元格 → 叠加写入 M 列成本2 (真诚成品新单)..."):
-                    zc_res = sync_costs(zc_client, sync_items, cost_col_letter='M')
+                with st.spinner("正在同步成品成本…"):
+                    zc_res = sync_costs(zc_client, sync_items, cost_col_letter='M', overwrite=overwrite)
                 st.success(f"✅ 匹配 **{len(zc_res['matched'])}** 条 / 提交 {len(sync_items)} 条")
                 if zc_res['unmatched']:
                     st.warning(f"⚠️ {len(zc_res['unmatched'])} 条没匹配到: "
@@ -271,7 +312,7 @@ def sync_zhencheng_finished_items(items):
                     for m in zc_res['matched'][:50]:
                         col = m.get('cost_col_letter', 'M')
                         st.text(f"✅ 行 {m['row']}: key={m['match_key']} "
-                                f"{col} {m['old_m']} + {m['add_cost']} = {m['new_m']}"
+                                f"{col} {m['old_m']} → {m['new_m']}"
                                 + (f"  H '{m['old_h']}' → '{m['new_h']}'" if m.get('new_h') else ''))
         except Exception as e:
             st.error(f"❌ 同步真诚现货到真诚成品新单失败: {e}")
@@ -398,6 +439,7 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
         type="primary",
         key=f'dl_nat_{factory_name}_{datetime.now().timestamp()}',
     )
+    remember_generated()
     st.session_state.setdefault('history', []).append({
         '时间': datetime.now().strftime('%H:%M:%S'),
         '类型': f'聚水潭-{factory_name}真诚',
@@ -502,6 +544,7 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
                         mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                         key=f'dl_profit_{factory_name}_{_dt.now().timestamp()}',
                     )
+                    remember_generated()
                 except Exception as e:
                     st.warning(f"生成利润简报失败 (不影响主流程): {e}")
 
@@ -522,6 +565,7 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
                         type="primary",
                         key=f'dl_natcomplete_{factory_name}_{datetime.now().timestamp()}',
                     )
+                    remember_generated()
                     st.caption("完成文件在原表最右侧追加: 总镶嵌成本 | 客户名称 | 利润 | 利润率")
                     st.session_state.setdefault('history', []).append({
                         '时间': datetime.now().strftime('%H:%M:%S'),
@@ -837,6 +881,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                     type="primary",
                     key=f'dl_jst_{datetime.now().timestamp()}',
                 )
+                remember_generated()
                 # session 历史 (聚水潭)
                 st.session_state.setdefault('history', []).append({
                     '时间': datetime.now().strftime('%H:%M:%S'),
@@ -870,6 +915,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                 key=f'dl_done_{datetime.now().timestamp()}',
                 type="primary",
             )
+            remember_generated()
             cap_parts = []
             if clients: cap_parts.append("客户名/利润/利润率")
             if spots: cap_parts.append("现货 AD 单价成本")
@@ -968,8 +1014,8 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                     st.subheader(f"🔗 同步镶嵌成本到成品新单 ({len(sync_items)} 条)")
                     fp_client = FinishedProductsClient(
                         _client.app_id, _client.app_secret)
-                    with st.spinner(f"匹配 P 列 → 叠加写入 M 列..."):
-                        result = sync_costs(fp_client, sync_items)
+                    with st.spinner(f"正在同步成品成本…"):
+                        result = sync_costs(fp_client, sync_items, overwrite=overwrite)
                     matched = result['matched']
                     unmatched = result['unmatched']
                     errors = result['errors']
@@ -977,7 +1023,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                     if matched:
                         h_updated = sum(1 for m in matched if m.get('new_h') is not None)
                         st.success(
-                            f"✅ 命中 {len(matched)} 条, M 列已叠加"
+                            f"✅ 命中 {len(matched)} 条, M 列已更新"
                             + (f", H 列 {h_updated} 条去掉「待出货」" if h_updated else "")
                         )
                         with st.expander(f"命中详情 ({len(matched)})", expanded=False):
@@ -989,7 +1035,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                                 p_display = m.get('p_val') or m.get('match_key')
                                 lines.append(
                                     f"  r{m['row']:>4}  P={p_display:<18} "
-                                    f"M {m['old_m']:>6} + {m['add_cost']:>6} = "
+                                    f"M {m['old_m']:>6} → "
                                     f"{m['new_m']:>6}  {m['name']}{h_str}"
                                 )
                             st.code('\n'.join(lines), language=None)
