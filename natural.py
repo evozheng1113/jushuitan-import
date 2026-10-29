@@ -551,6 +551,14 @@ def parse_buxin(xlsx_path, au_price, pt_price):
         rng = _find_last_batch_range(ws)
         if not rng: continue
         start, end = rng
+        batch_date = ''
+        for title_row in range(start - 2, 0, -1):
+            title = str(ws.cell(title_row, 2).value or '')
+            m = re.search(r'(20\d{2})年(\d{1,2})月(\d{1,2})日', title)
+            if m:
+                batch_date = '%04d-%02d-%02d' % tuple(map(int, m.groups()))
+                break
+        has_order_column = str(ws.cell(start - 2, 1).value or '').strip() == '订单号' 
         print(f"  [{sname}] 最后一批 row {start}-{end}")
         for r in range(start, end + 1):
             kuanhao = ws.cell(row=r, column=2).value
@@ -588,6 +596,12 @@ def parse_buxin(xlsx_path, au_price, pt_price):
                 '_副石1金额': side1_amt,
                 '_副石2金额': side2_amt,
                 '_sheet': sname,
+                '_工厂': '布心',
+                '下单单号': str(ws.cell(r, 1).value or '').strip() if has_order_column else '',
+                '_布心批次': batch_date,
+                '_布心原始': {'金耗': l_val, '总额': am_val, '系数': ratio,
+                            '金价': gp, '品名': str(name or '').strip(),
+                            '手寸': str(ring or '').strip(), '件数': qty},
             })
     return items
 

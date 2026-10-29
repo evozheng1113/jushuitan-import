@@ -4,7 +4,7 @@
 - 凭证: Streamlit Cloud Secrets 加密存
 """
 import streamlit as st
-import tempfile, os, traceback, re, time, math
+import tempfile, os, traceback, re, time, math, hashlib
 from datetime import datetime
 
 import factories
@@ -25,7 +25,8 @@ NATURAL_FACTORY_MAP_BUXIN = '布心'  # 布心走独立文件, 靠文件名单�
 st.set_page_config(page_title="聚水潭入库生成", page_icon="💎", layout="centered")
 
 st.title("💎 聚水潭入库 Excel 生成")
-st.caption("上传工厂出货单 → 查飞书 → 生成聚水潭批量入库模板")
+st.caption("上传出货单 → 核对金价 → 生成文件或同步成本")
+st.caption("版本：2026.10.29 · 布心 / 黛宝更新")
 
 # ---------------- 飞书工具 ----------------
 def _fetch_after_update(client, key, target_cost, max_wait=4):
@@ -73,7 +74,7 @@ except Exception as e:
 if feishu_ready:
     st.success("✓ 飞书已连接")
     # v24.4: 真诚多维表结构诊断按钮
-    with st.expander("🔬 诊断真诚多维表结构 (点开查字段名 + 3 条样本)"):
+    with st.expander("连接诊断（遇到问题再打开）"):
         if st.button("拉取真诚多维表字段 + 样本", key='probe_zc'):
             try:
                 from zhencheng_bitable import probe_zhencheng_table
@@ -127,7 +128,7 @@ include_spots = True
 use_feishu = feishu_ready   # 隐式: 有客户单就查 (不再让用户选)
 
 st.divider()
-st.markdown("**附加产物**（可选, 不勾也会生成工厂单完成文件）:")
+st.markdown("**处理选项**")
 
 col_a, col_b = st.columns(2)
 with col_a:
@@ -146,23 +147,17 @@ with col_b:
 overwrite = False
 debug_mode = False
 if sync_feishu:
-    st.warning(
-        "⚠️ **将写入飞书**: 修改「镶嵌成本」字段。"
-        "默认叠加 (原值+今天值), 已退款件自动写 0。"
-        "**确认这是今天的最新账单**再生成。"
-    )
-    col_o, col_d = st.columns(2)
-    with col_o:
-        overwrite = st.checkbox(
-            "覆盖模式 (不叠加, 直接覆盖)",
-            value=False,
-        )
-    with col_d:
-        debug_mode = st.checkbox(
-            "🔬 诊断模式 (写入异常时打开)",
-            value=False,
-            help="详情行附加 record_id / 写入 payload / 飞书返回 code",
-        )
+    st.caption("真诚客户单更新镶嵌成本；真诚现货叠加到 M 列成本2。")
+    with st.expander("高级设置"):
+        overwrite = st.checkbox("培育成本覆盖模式", value=False)
+        debug_mode = st.checkbox("显示诊断信息", value=False)
+
+buxin_initial = {'PT950': False, '18K': False}
+if uploaded and sync_feishu and ('ZC' in uploaded.name.upper() or '布心' in factory_label):
+    with st.expander("布心首次接入：核对已有成本"):
+        st.caption("仅在首次接入遇到已有成本时使用。分别确认本文件最后一批是否尚未同步；不确定就不勾选。以后自动跳过已同步出货。")
+        buxin_initial['PT950'] = st.checkbox("确认 PT 最后一批尚未同步，允许更新已有成本", key='buxin_pt_' + hashlib.sha256(uploaded.getvalue()).hexdigest())
+        buxin_initial['18K'] = st.checkbox("确认 18K 最后一批尚未同步，允许更新已有成本", key='buxin_18k_' + hashlib.sha256(uploaded.getvalue()).hexdigest())
 
 
 # ---------------- 工厂识别 ----------------
@@ -272,7 +267,7 @@ def sync_zhencheng_finished_items(items):
                 if zc_res['errors']:
                     st.error(f"❌ {len(zc_res['errors'])} 条错误")
                     for e_ in zc_res['errors'][:5]: st.text(f"  {e_}")
-                with st.expander("📋 每条命中详情 (真诚现货)", expanded=True):
+                with st.expander("📋 每条命中详情 (真诚现货)", expanded=False):
                     for m in zc_res['matched'][:50]:
                         col = m.get('cost_col_letter', 'M')
                         st.text(f"✅ 行 {m['row']}: key={m['match_key']} "
@@ -297,6 +292,8 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
             items = parser(in_path, au_price=au, pt_price=pt)
             for item in items:
                 item['_工厂'] = factory_name
+                if factory_name == '布心':
+                    item['_布心首次确认'] = buxin_initial.get(item.get('材质颜色'), False)
         except Exception as e:
             st.error(f"❌ 解析失败: {e}")
             with st.expander("详细错误"):
@@ -304,6 +301,11 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
             return 0
 
     st.info(f"识别到 **{len(items)}** 件天然钻客订")
+    if factory_name == '布心':
+        for material in ('PT950', '18K'):
+            batch_items = [i for i in items if i.get('材质颜色') == material]
+            if batch_items:
+                st.caption(f"{material}：{batch_items[0].get('_布心批次') or '日期待核对'} · {len(batch_items)} 件")
     if not items:
         st.warning("⚠️ 没有天然钻客订件, 天然聚水潭跳过")
         return 0
@@ -341,7 +343,8 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
                 layout_lines.append(f"[{title}] ❌ 拉取失败: {e}")
         st.code('\n'.join(layout_lines), language=None)
 
-    placeholder = st.empty()
+    with st.expander("查询明细"):
+        placeholder = st.empty()
     progress = st.progress(0.0)
     lines = []
     for i, it in enumerate(items):
@@ -413,21 +416,14 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
             # v28: 只同步"客户单"到真诚多维表, 现货 (E-ZC-*) 走真诚成品新单 sheet
             bitable_items = [it for it in items if it.get('类别') != '部门-真诚-现货']
             st.subheader(f"🔗 同步镶嵌成本到真诚多维表 ({len(bitable_items)} 件客户单)")
-            with st.spinner("查询字段结构 + 逐条写入 + 轮询等公式..."):
+            with st.spinner("正在匹配订单并同步成本…"):
                 app_id, app_secret = load_credentials()
                 bitable_client = FeishuClient(app_id, app_secret)
                 sync_result = sync_zhencheng_costs(bitable_client, bitable_items)
 
-            st.success(
-                f"✅ 匹配 **{sync_result['matched']}** / 写入 **{sync_result['updated']}** "
-                f"| 证书=`{sync_result.get('cert_field') or '(无)'}` "
-                f"款号=`{sync_result.get('name_field') or '(无)'}` "
-                f"镶嵌=`{sync_result['cost_field']}` "
-                f"裸钻=`{sync_result.get('bare_cost_field') or '(无)'}` "
-                f"配石=`{sync_result.get('side_cost_field') or '(无)'}` "
-                f"利润=`{sync_result.get('profit_field') or '(无)'}` "
-                f"利润率=`{sync_result.get('rate_field') or '(无)'}`"
-            )
+            skipped = sum(d.get('status') == 'skip' for d in sync_result['details'])
+            attention = len(sync_result['not_found']) + len(sync_result['errors'])
+            st.info(f"成功 {sync_result['updated']} 笔 · 跳过 {skipped} 笔 · 需要核对 {attention} 笔")
             if sync_result['not_found']:
                 st.warning(f"⚠️ {len(sync_result['not_found'])} 条没匹配到: "
                            f"{', '.join(sync_result['not_found'][:10])}"
@@ -437,7 +433,7 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
                 for err in sync_result['errors'][:5]:
                     st.text(f"  {err}")
 
-            with st.expander("📋 每条详情 (含利润率)", expanded=True):
+            with st.expander("📋 每条详情 (含利润率)", expanded=False):
                 for d in sync_result['details']:
                     ico = {'updated': '✅', 'would_update': '🔵', 'not_found': '⚠️',
                            'error': '❌', 'skip': '⏭️'}.get(d.get('status'), '·')
@@ -944,7 +940,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                     if zc_res['errors']:
                         st.error(f"❌ {len(zc_res['errors'])} 件错误")
                         for e in zc_res['errors'][:5]: st.text(f"  {e}")
-                    with st.expander("📋 每条详情 (真诚培育)", expanded=True):
+                    with st.expander("📋 每条详情 (真诚培育)", expanded=False):
                         for d in zc_res['details']:
                             ico = {'updated':'✅','not_found':'⚠️','error':'❌','skip':'⏭️'}.get(d.get('status'),'·')
                             line = f"{ico} #{d.get('no')} 客户={d.get('name') or '空'}"

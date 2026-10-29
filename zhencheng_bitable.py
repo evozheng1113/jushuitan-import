@@ -6,6 +6,7 @@
 
 猛哥客户单先按完整“下单单号”精确匹配，数字简写允许补 ZC-E-；
 命中多条时停止该条写入。姓名日期/数字单号不拆成客户名模糊兜底。
+黛宝 D-日期-尾号去除“真诚”标签后优先精确匹配下单单号。
 其余匹配优先级 (证书优先, 每件唯一; 款号=客户名会重复所以兜底):
   1. 证书号 → 生成 4 种 variants 依次试 (原样 / -1 后缀 / 去 IGI-GIA-LG 前缀 / 去前缀+-1)
   2. 找不到 → 用款号 (客户名) 兜底
@@ -167,6 +168,12 @@ def _mengge_order_variants(order):
     return variants
 
 
+def _daibao_order_number(order):
+    """只清理黛宝订单中的部门标签，完整保留 D 前缀、日期与尾号。"""
+    value = str(order or '').replace('真诚', '').strip()
+    return value if re.fullmatch(r'D-\d{1,2}-\d{1,2}-\d+', value) else None
+
+
 def _looks_like_order(order):
     s = str(order or '').strip()
     return bool(re.fullmatch(r'(?:ZC-E-)?\d{1,2}-\d{1,2}-\d+', s)
@@ -315,6 +322,10 @@ def sync_zhencheng_costs(client, items, dry_run=False):
     result['bare_cost_field'] = bare_cost_field
     result['side_cost_field'] = side_cost_field
 
+    # 布心先检查全批匹配；多件命中同一记录时整组留待核对。
+    from buxin_sync import prepare_matches, prepare_ledger, MARKER_FIELD
+    buxin_matches = prepare_matches(client, items, fields_meta,
+                                   ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID)
     # ---- 逐条同步 ----
     for it in items:
         cost = it.get('镶嵌成本')
@@ -342,12 +353,23 @@ def sync_zhencheng_costs(client, items, dry_run=False):
 
         rec = None
         matched_by = None
+        is_buxin = it.get('_工厂') == '布心'
+        if is_buxin:
+            rec, matched_by, problem = buxin_matches[id(it)]
+            if problem:
+                result['errors'].append(f'#{no} {kh}: {problem}')
+                result['details'].append({'no': no, 'name': kh, 'status': 'error', 'reason': problem})
+                continue
         is_mengge = it.get('_工厂') == '猛哥'
-        explicit_order = is_mengge and _looks_like_order(kh)
-        if is_mengge and order_field:
+        daibao_order = (_daibao_order_number(kh)
+                         if it.get('_工厂') == '黛宝' else None)
+        explicit_order = bool(daibao_order) or (is_mengge and _looks_like_order(kh))
+        order_variants = ([daibao_order] if daibao_order else
+                          _mengge_order_variants(kh) if is_mengge else [])
+        if order_variants and order_field:
             try:
                 rec, matched_by = _find_unique_order(
-                    client, order_field, _mengge_order_variants(kh))
+                    client, order_field, order_variants)
             except Exception as e:
                 result['errors'].append(f'#{no} {kh}: {e}')
                 result['details'].append({'no': no, 'cert': cert, 'name': kh,
@@ -355,7 +377,7 @@ def sync_zhencheng_costs(client, items, dry_run=False):
                 continue
 
         # 1. 证书号 (猛哥先查下单单号，其他工厂保持证书优先)
-        if not rec and cert_field and cert:
+        if not is_buxin and not rec and cert_field and cert:
             for cv in _cert_variants(cert):
                 try:
                     r = client.find_by_field(ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID,
@@ -369,7 +391,7 @@ def sync_zhencheng_costs(client, items, dry_run=False):
 
         # 2. GIA 客户名 (从飞书 GIA 表锁定到的真实客户名)
         # v26.1: 复合名 "销售-客户" 场景 → 用 variants 拆 - 每段都试
-        if not rec and not explicit_order and name_field and gia_cust:
+        if not is_buxin and not rec and not explicit_order and name_field and gia_cust:
             for nv in _name_variants(gia_cust):
                 try:
                     r = client.find_by_field(ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID,
@@ -382,7 +404,7 @@ def sync_zhencheng_costs(client, items, dry_run=False):
                     break
 
         # 3. 兜底: 工厂单款号 (猛哥 B 列本身就是客户名; 布心 B 列也可能是"销售-客户")
-        if not rec and not explicit_order and name_field and kh and kh != gia_cust:
+        if not is_buxin and not rec and not explicit_order and name_field and kh and kh != gia_cust:
             for nv in _name_variants(kh):
                 try:
                     r = client.find_by_field(ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID,
@@ -408,6 +430,20 @@ def sync_zhencheng_costs(client, items, dry_run=False):
         result['matched'] += 1
         rec_id = rec.get('record_id')
 
+        ledger_payload = None
+        if is_buxin:
+            try:
+                ledger_payload, duplicate = prepare_ledger(it, rec, fields_meta, cost_field)
+                if duplicate:
+                    result['details'].append({'no': no, 'name': display_name,
+                                              'status': 'skip', 'reason': '已同步，跳过重复出货'})
+                    continue
+            except Exception as e:
+                result['errors'].append(f'#{no} {kh}: {e}')
+                result['details'].append({'no': no, 'name': display_name,
+                                          'status': 'error', 'reason': str(e)})
+                continue
+
         if dry_run:
             result['details'].append({'no': no, 'cert': cert, 'name': display_name,
                                        'status': 'would_update',
@@ -420,6 +456,8 @@ def sync_zhencheng_costs(client, items, dry_run=False):
             # 先取匹配到的 rec 里现有 fields, 判断哪些空
             existing = rec.get('fields', {}) or {}
             payload = {cost_field: cost}   # 镶嵌成本永远覆盖
+            if ledger_payload is not None:
+                payload[MARKER_FIELD] = ledger_payload
             filled_extras = []
 
             # 证书号: it['证书号'] → 用 _norm_code 归一化 (跟聚水潭商品编码同格式)
@@ -430,7 +468,7 @@ def sync_zhencheng_costs(client, items, dry_run=False):
                     filled_extras.append(f'证书={payload[cert_field]}')
 
             # 裸钻成本 (聚水潭 成本1) = gia['cost1']
-            gia_info = it.get('_gia') or {}
+            gia_info = {} if is_buxin else (it.get('_gia') or {})
             bare = gia_info.get('cost1')
             if not bare_cost_field:
                 if isinstance(bare, (int, float)) and bare > 0:
@@ -456,8 +494,10 @@ def sync_zhencheng_costs(client, items, dry_run=False):
                 else:
                     filled_extras.append(f'配石跳过(飞书已有={cur_side})')
 
-            client.update_record(ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID,
-                                 rec_id, payload)
+            response = client.update_record(ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID,
+                                            rec_id, payload)
+            if not isinstance(response, dict) or response.get('code') != 0:
+                raise RuntimeError(f'飞书未确认写入成功: {response}')
             result['updated'] += 1
 
             # v24.1: 轮询等公式刷新, 回读利润/利润率写回 item
