@@ -35,7 +35,7 @@ def _request(client, method, suffix, **kwargs):
     response = getattr(requests, method)(BASE + suffix, headers=client._headers(json_body=True), timeout=30, **kwargs)
     data = response.json()
     if data.get('code') != 0:
-        raise RuntimeError(f"文件记录服务不可用：{data.get('msg') or data.get('code')}")
+        raise RuntimeError(f"飞书错误 {data.get('code')}：{str(data.get('msg') or '未知错误')[:250]}")
     return data.get('data') or {}
 
 
@@ -68,8 +68,19 @@ def _read(client, sheet):
         rng = f"{sheet['sheet_id']}!A{start}:E{min(count, start + 4999)}"
         data = _request(client, 'get', f'/sheets/v2/spreadsheets/{client.spreadsheet_token}/values/{quote(rng, safe="!:")}')
         rows.extend(data.get('valueRange', {}).get('values') or [])
-    if rows and rows[0] and rows[0] != HEADER:
-        raise RuntimeError('网站文件记录表头不符，请核对；不会覆盖原内容')
+    def cell_text(value):
+        if value is None: return ''
+        if isinstance(value, list):
+            return ''.join(str(v.get('text', '')) if isinstance(v, dict) else str(v) for v in value)
+        return str(value)
+    rows = [[cell_text(v) for v in (row or [])] for row in rows]
+    # 空表可能返回 []、[[]] 或多行 [null, ...]；这些都不是错误表头。
+    while rows and not any(v.strip() for v in rows[-1]): rows.pop()
+    if rows:
+        header = [v.strip() for v in rows[0]]
+        while header and not header[-1]: header.pop()
+        if header != HEADER:
+            raise RuntimeError('网站文件记录表头不符，请核对；不会覆盖原内容')
     return rows
 
 
@@ -86,19 +97,39 @@ def _row(content, raw, filename, status):
 
 
 def check_and_record(client, data, filename):
-    content, raw = fingerprint(data)
-    sheet = _sheet(client)
-    rows = _read(client, sheet)
+    try:
+        content, raw = fingerprint(data)
+    except Exception as exc:
+        raise RuntimeError(f'读取出货文件失败：{type(exc).__name__}：{exc}') from exc
+    try:
+        sheet = _sheet(client)
+    except Exception as exc:
+        raise RuntimeError(f'访问文件记录工作表失败：{exc}') from exc
+    try:
+        rows = _read(client, sheet)
+    except Exception as exc:
+        raise RuntimeError(f'读取上传记录失败：{exc}') from exc
     matches = [r for r in rows[1:] if r and (r[0] == content or (len(r) > 4 and r[4] == raw))]
     info = {'seen': bool(matches), 'generated': any(len(r) > 3 and r[3] == '已生成结果' for r in matches),
             'content': content, 'raw': raw, 'sheet': sheet}
     if not matches:
-        _append(client, sheet, ([] if rows else [HEADER]) + [_row(content, raw, filename, '已加载')])
+        try:
+            _append(client, sheet, ([] if rows else [HEADER]) + [_row(content, raw, filename, '已加载')])
+        except Exception as exc:
+            # 查询成功和写入历史失败是两种状态，不要把前者也标成未知。
+            info['record_error'] = f'保存上传记录失败：{exc}'
     return info
 
 
 def record_generated(client, info, filename):
     if info.get('unknown') or info.get('generated'):
         return
-    _append(client, info['sheet'], [_row(info['content'], info['raw'], filename, '已生成结果')])
+    if info.get('record_error'):
+        # 上次写入可能未提交或响应超时；重读后再决定是否需要表头。
+        sheet = _sheet(client)
+        rows = _read(client, sheet)
+        _append(client, sheet, ([] if rows else [HEADER]) + [_row(info['content'], info['raw'], filename, '已生成结果')])
+        info.pop('record_error', None)
+    else:
+        _append(client, info['sheet'], [_row(info['content'], info['raw'], filename, '已生成结果')])
     info['generated'] = True

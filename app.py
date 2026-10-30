@@ -26,7 +26,7 @@ st.set_page_config(page_title="聚水潭入库生成", page_icon="💎", layout=
 
 st.title("💎 聚水潭入库 Excel 生成")
 st.caption("上传出货单 → 核对金价 → 生成文件或同步成本")
-st.caption("版本：2026.10.29.2")
+st.caption("版本：2026.10.30")
 
 # ---------------- 飞书工具 ----------------
 def _fetch_after_update(client, key, target_cost, max_wait=4):
@@ -108,7 +108,7 @@ uploaded = st.file_uploader(
 # 文件历史与成本成功状态分开；记录失败不当成首次上传。
 if uploaded and feishu_ready:
     upload_key = hashlib.sha256(uploaded.getvalue()).hexdigest()
-    upload_cache = st.session_state.setdefault('_upload_checks', {})
+    upload_cache = st.session_state.setdefault('_upload_checks_v2', {})
     if upload_key not in upload_cache:
         try:
             from upload_registry import check_and_record
@@ -116,12 +116,21 @@ if uploaded and feishu_ready:
             upload_id, upload_secret = load_credentials()
             upload_client = FinishedProductsClient(upload_id, upload_secret)
             upload_cache[upload_key] = check_and_record(upload_client, uploaded.getvalue(), uploaded.name)
-        except Exception:
-            upload_cache[upload_key] = {'unknown': True}
+        except Exception as exc:
+            upload_cache[upload_key] = {'unknown': True, 'reason': str(exc)[:500]}
     upload_info = upload_cache[upload_key]
     if upload_info.get('unknown'):
-        st.warning("暂时无法核对上传记录，请勿据此判断是否重复。")
+        st.warning("上传记录查询失败，尚无法判断是否上传过。")
+        with st.expander("查看失败原因"):
+            st.text(upload_info.get('reason') or '请点击重查，获取具体原因。')
         if st.button("重查上传记录"):
+            upload_cache.pop(upload_key, None)
+            st.rerun()
+    elif upload_info.get('record_error'):
+        st.warning("已核对，未找到历史上传记录；本次记录保存失败。")
+        with st.expander("查看失败原因"):
+            st.text(upload_info['record_error'])
+        if st.button("重试保存上传记录"):
             upload_cache.pop(upload_key, None)
             st.rerun()
     elif upload_info.get('generated'):
@@ -189,7 +198,7 @@ def remember_generated():
     """仅在结果文件生成后记录；不标记飞书成本已成功同步。"""
     if not uploaded or not feishu_ready:
         return
-    info = st.session_state.get('_upload_checks', {}).get(upload_key, {})
+    info = st.session_state.get('_upload_checks_v2', {}).get(upload_key, {})
     if not info or info.get('unknown') or info.get('generated'):
         return
     try:
