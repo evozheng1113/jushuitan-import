@@ -277,6 +277,17 @@ def sync_zhencheng_costs(client, items, dry_run=False):
         'details': [], 'dry_run': dry_run,
     }
 
+    # 黛宝模板同时含天然/培育，模板名称不决定业务表。
+    daibao_items = [it for it in items if it.get('_工厂') == '黛宝']
+    if daibao_items:
+        routed = _sync_daibao_sales(client, daibao_items, dry_run)
+        other_items = [it for it in items if it.get('_工厂') != '黛宝']
+        if other_items:
+            other = sync_zhencheng_costs(client, other_items, dry_run=dry_run)
+            for key in ('matched', 'updated'): routed[key] += other[key]
+            for key in ('details', 'errors', 'not_found'): routed[key].extend(other[key])
+        return routed
+
     # ---- 探测字段 ----
     fields_meta = client.list_fields(ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID)
     if not fields_meta:
@@ -549,6 +560,138 @@ def probe_zhencheng_table(client, sample_size=3):
     samples = data.get('data', {}).get('items', []) if data.get('code') == 0 else []
     return {'fields': field_summary, 'samples': samples,
             'list_code': data.get('code'), 'list_msg': data.get('msg')}
+
+
+
+
+# 黛宝的准确单号/证书可能位于两个销售表，先查完再决定唯一写入位置。
+_DAIBAO_SALES_TABLES = (
+    ('珠宝销售副本·收支表', 'LvnrbfG64areQPsccHYcXmf7njd', 'tbl2GcSHhDqgQzv7'),
+    ('真诚多维表', ZHENCHENG_APP_TOKEN, ZHENCHENG_TABLE_ID),
+)
+
+
+def _daibao_cert_variants(cert):
+    raw = str(cert or '').strip()
+    if not raw:
+        return []
+    # zc 是部门标签，主体和尾号保持不变；不把 -2 等尾号改成 -1。
+    base = re.sub(r'\s*zc$', '', raw, flags=re.I).strip()
+    roots = _cert_variants(base)
+    return list(dict.fromkeys([raw] + roots + [v + suffix for v in roots
+                                             for suffix in (' zc', 'zc', ' ZC', 'ZC')]))
+
+
+def _daibao_find_exact(client, app, table, field, values):
+    import requests
+    found = {}
+    for value in values:
+        response = requests.post(
+            f'https://open.feishu.cn/open-apis/bitable/v1/apps/{app}/tables/{table}/records/search',
+            headers=client._headers(),
+            json={'filter': {'conjunction': 'and', 'conditions': [
+                {'field_name': field, 'operator': 'is', 'value': [value]}]}}, timeout=15)
+        data = response.json()
+        if data.get('code') != 0:
+            raise RuntimeError(f'查询 {field} 失败：{data.get("code")} {data.get("msg")}')
+        page = data.get('data') or {}
+        records = page.get('items') or []
+        if page.get('has_more') or len(records) > 1:
+            raise ValueError(f'{field}={value} 命中多条，暂不写入')
+        for record in records:
+            if not record.get('record_id'): raise ValueError('查询结果缺少记录编号')
+            found[record['record_id']] = record
+    return found
+
+
+def _sync_daibao_sales(client, items, dry_run=False):
+    result = dict(matched=0, updated=0, not_found=[], errors=[], details=[], dry_run=dry_run,
+                  cert_field=None, name_field=None, order_field=None, cost_field='镶嵌成本',
+                  profit_field=None, rate_field=None, bare_cost_field=None, side_cost_field=None)
+    tables = []
+    try:
+        for title, app, table in _DAIBAO_SALES_TABLES:
+            meta = client.list_fields(app, table)
+            if not meta: raise RuntimeError(f'{title} 无法读取字段，暂不写入')
+            tables.append((title, app, table, meta))
+    except Exception as exc:
+        result['errors'].append(str(exc))
+        return result
+    pending = []
+    for item in items:
+        no = item.get('no')
+        order = _daibao_order_number(item.get('款号') or item.get('下单编号') or item.get('单号'))
+        certs = _daibao_cert_variants(item.get('证书号') or item.get('证书编号'))
+        label = order or str(item.get('款号') or '')
+        detail = dict(no=no, name=label, cert=item.get('证书号') or '', status='error')
+        try:
+            if item.get('镶嵌成本') is None: raise ValueError('缺少镶嵌成本')
+            if not order and not certs: raise ValueError('没有准确单号或证书，暂不按客户姓名猜测')
+            matches = []
+            for title, app, table, meta in tables:
+                of = _pick_field(meta, ['下单单号', '下单编号', '订单编号'])
+                cf = _pick_field(meta, CERT_FIELD_CANDIDATES)
+                by_order = _daibao_find_exact(client, app, table, of, [order]) if of and order else {}
+                by_cert = _daibao_find_exact(client, app, table, cf, certs) if cf and certs else {}
+                combined = dict(by_order, **by_cert)
+                if len(combined) > 1: raise ValueError(f'{title} 单号和证书对应不同记录，暂不写入')
+                for rid, rec in combined.items():
+                    existing_cert = FeishuClient.get_text((rec.get('fields') or {}).get(cf)) if cf else ''
+                    if rid in by_order and existing_cert and certs and not set(_daibao_cert_variants(existing_cert)).intersection(certs):
+                        raise ValueError(f'{title} 单号命中但证书不一致，暂不写入')
+                    cost_field = _pick_field(meta, COST_FIELD_CANDIDATES, exclude_readonly=True)
+                    if not cost_field: raise ValueError(f'{title} 没有可写的镶嵌成本字段')
+                    via = f'{title}：' + ('下单单号=' + order if rid in by_order else '证书=' + str(item.get('证书号') or ''))
+                    matches.append((app, table, rid, cost_field, meta, via))
+            if len(matches) > 1: raise ValueError('两张销售表均命中，请核对归属，暂不写入')
+            if not matches:
+                detail.update(status='not_found', reason='两张销售表均未找到准确单号或证书（已兼容 zc 标签）')
+                result['not_found'].append(label)
+                result['details'].append(detail)
+                continue
+            pending.append((item, detail, matches[0]))
+        except Exception as exc:
+            detail['reason'] = str(exc)
+            result['errors'].append(f'#{no} {label}: {exc}')
+            result['details'].append(detail)
+    from collections import Counter
+    counts = Counter(tuple(match[:3]) for _, _, match in pending)
+    for item, detail, match in pending:
+        app, table, rid, cost_field, meta, via = match
+        if counts[(app, table, rid)] > 1:
+            detail['reason'] = '本次多件命中同一记录，请核对后再写入'
+            result['errors'].append(f"#{item.get('no')}: {detail['reason']}")
+            result['details'].append(detail)
+            continue
+        result['matched'] += 1
+        cost = item['镶嵌成本']
+        detail.update(matched_by=via, record_id=rid, cost=cost)
+        if dry_run:
+            detail['status'] = 'would_update'
+        else:
+            try:
+                response = client.update_record(app, table, rid, {cost_field: cost})
+                if not isinstance(response, dict) or response.get('code') != 0:
+                    raise RuntimeError('飞书未确认写入成功')
+                result['updated'] += 1
+                detail['status'] = 'updated'
+                # 写入成功与利润回读分开；回读失败不误报成本写入失败。
+                try:
+                    refreshed = _get_record_by_id(client, app, table, rid) or {}
+                    fields = refreshed.get('fields') or {}
+                    for key, candidates, item_key in [('profit', PROFIT_FIELD_CANDIDATES, '飞书利润'),
+                                                       ('rate', RATE_FIELD_CANDIDATES, '飞书利润率')]:
+                        field = _pick_field(meta, candidates)
+                        value = FeishuClient.get_number(fields.get(field)) if field else None
+                        detail[key] = value
+                        item[item_key] = value
+                except Exception:
+                    detail['note'] = '成本已写入，利润待刷新'
+            except Exception as exc:
+                detail.update(status='error', reason=str(exc))
+                result['errors'].append(f"#{item.get('no')}: {exc}")
+        result['details'].append(detail)
+    return result
 
 
 # ============ CLI 探测 (调试用: 打印字段结构) ============
