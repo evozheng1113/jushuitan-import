@@ -26,7 +26,7 @@ st.set_page_config(page_title="聚水潭入库生成", page_icon="💎", layout=
 
 st.title("💎 聚水潭入库 Excel 生成")
 st.caption("上传出货单 → 核对金价 → 生成文件或同步成本")
-st.caption("版本：2026.10.30")
+st.caption("版本：2026.11.02")
 
 # ---------------- 飞书工具 ----------------
 def _fetch_after_update(client, key, target_cost, max_wait=4):
@@ -209,6 +209,22 @@ def remember_generated():
     except Exception:
         st.caption("结果已生成，但运行记录暂未保存。")
 
+
+
+
+def archive_completed(data, source_path, items, factory, filename, flow):
+    try:
+        from factory_archive import TOKEN, snapshot, append_archive
+        from finished_products import FinishedProductsClient
+        rows = snapshot(data, source_path, items, factory, filename, flow)
+        app_id, app_secret = load_credentials()
+        archive_client = FinishedProductsClient(app_id, app_secret, spreadsheet_token=TOKEN)
+        title = append_archive(archive_client, rows, factory)
+        st.caption(f"已追加到工厂流水 · {title}")
+    except Exception as exc:
+        st.warning("工厂流水未确认归档，完成文件仍可下载。")
+        with st.expander("查看归档原因"):
+            st.write(str(exc))
 
 # ---------------- 工厂识别 ----------------
 FACTORY_HINTS = [
@@ -557,37 +573,6 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
                 except Exception as e:
                     st.warning(f"生成利润简报失败 (不影响主流程): {e}")
 
-                # v24.2: 工厂单完成文件 (原表追加 4 列: 总镶嵌成本/客户名/利润/利润率)
-                try:
-                    complete_path = tempfile.mktemp(suffix='.xlsx')
-                    natural.write_natural_complete(in_path, items, complete_path)
-                    with open(complete_path, 'rb') as f:
-                        complete_data = f.read()
-                    try: os.unlink(complete_path)
-                    except OSError: pass
-                    base = uploaded_name.rsplit('.', 1)[0]
-                    complete_fname = f'{datetime.now().strftime("%Y%m%d")}{base}_完成.xlsx'
-                    st.download_button(
-                        f"📥 下载工厂单完成文件 ({factory_name}, 追加4列)",
-                        data=complete_data, file_name=complete_fname,
-                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                        type="primary",
-                        key=f'dl_natcomplete_{factory_name}_{datetime.now().timestamp()}',
-                    )
-                    remember_generated()
-                    st.caption("完成文件在原表最右侧追加: 总镶嵌成本 | 客户名称 | 利润 | 利润率")
-                    st.session_state.setdefault('history', []).append({
-                        '时间': datetime.now().strftime('%H:%M:%S'),
-                        '类型': f'工厂单完成-{factory_name}真诚',
-                        '工厂': factory_name,
-                        '件数': len(items),
-                        '文件名': complete_fname,
-                        '_data': complete_data,
-                    })
-                except Exception as e:
-                    st.error(f"❌ 生成工厂单完成文件失败: {e}")
-                    with st.expander("详细错误"):
-                        st.code(traceback.format_exc())
         except Exception as e:
             st.error(f"❌ 同步真诚多维表失败: {e}")
             with st.expander("详细错误"):
@@ -599,6 +584,39 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
     else:
         st.info(f"ℹ️ 有 {len(items)} 件可同步到真诚多维表 "
                 f"(勾选「✏️ 同步今日成本到飞书」后才写入)")
+
+    # v24.2: 工厂单完成文件 (原表追加 4 列: 总镶嵌成本/客户名/利润/利润率)
+    try:
+        complete_path = tempfile.mktemp(suffix='.xlsx')
+        natural.write_natural_complete(in_path, items, complete_path)
+        with open(complete_path, 'rb') as f:
+            complete_data = f.read()
+        try: os.unlink(complete_path)
+        except OSError: pass
+        base = uploaded_name.rsplit('.', 1)[0]
+        complete_fname = f'{datetime.now().strftime("%Y%m%d")}{base}_完成.xlsx'
+        st.download_button(
+            f"📥 下载工厂单完成文件 ({factory_name}, 追加4列)",
+            data=complete_data, file_name=complete_fname,
+            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            type="primary",
+            key=f'dl_natcomplete_{factory_name}_{datetime.now().timestamp()}',
+        )
+        remember_generated()
+        archive_completed(complete_data, in_path, items, factory_name, complete_fname, "真诚")
+        st.caption("完成文件在原表最右侧追加: 总镶嵌成本 | 客户名称 | 利润 | 利润率")
+        st.session_state.setdefault('history', []).append({
+            '时间': datetime.now().strftime('%H:%M:%S'),
+            '类型': f'工厂单完成-{factory_name}真诚',
+            '工厂': factory_name,
+            '件数': len(items),
+            '文件名': complete_fname,
+            '_data': complete_data,
+        })
+    except Exception as e:
+        st.error(f"❌ 生成工厂单完成文件失败: {e}")
+        with st.expander("详细错误"):
+            st.code(traceback.format_exc())
 
     return len(items)
 
@@ -925,6 +943,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                 type="primary",
             )
             remember_generated()
+            archive_completed(done_data, in_path, items, code, done_fname, "常规")
             cap_parts = []
             if clients: cap_parts.append("客户名/利润/利润率")
             if spots: cap_parts.append("现货 AD 单价成本")
