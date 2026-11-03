@@ -1,5 +1,6 @@
 """将本次完成单的数据快照追加到指定飞书电子表格；不写业务成本表。"""
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from io import BytesIO
 import math
 import openpyxl
@@ -8,7 +9,7 @@ import requests
 TOKEN = "VWlWsPmI9h5YMgtmHlNcHdgHnFh"
 BASE = "https://open.feishu.cn/open-apis"
 NAMES = {"A": "雅希", "B": "二厂", "D": "黛宝", "E": "猛哥", "BUXIN": "布心"}
-ALIASES = {"雅希": {"雅希", "广州厂", "雅希工厂"},
+ALIASES = {"雅希": {"雅希", "广州", "广州厂", "雅希工厂"},
            "二厂": {"二厂", "二厂工厂", "倾城", "倾诚"},
            "黛宝": {"黛宝", "黛宝工厂"}, "猛哥": {"猛哥", "猛哥工厂"},
            "布心": {"布心", "布心工厂"}}
@@ -39,7 +40,7 @@ def snapshot(data, source_path, items, factory, filename, flow):
     original = openpyxl.load_workbook(source_path, data_only=True)
     original_formulas = openpyxl.load_workbook(source_path, data_only=False)
     records = []
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
     seen = set()
     try:
         for it in items:
@@ -120,8 +121,22 @@ def append_archive(client, rows, factory):
     sid = sheet["sheet_id"]
     width = max(map(len, rows))
     grid = sheet.get("grid_properties") or {}
-    if grid.get("column_count", 0) < width:
-        raise RuntimeError(f"{sheet['title']}需要至少{width}列，请先扩展工作表列数")
+    current_columns = grid.get("column_count")
+    if not isinstance(current_columns, int) or current_columns < 1:
+        raise RuntimeError(f"未能读取{sheet['title']}的列数，未追加数据")
+    if current_columns < width:
+        # 飞书官方增加行列接口：只在右侧添加空列，不改动已有数据。
+        extra = width - current_columns
+        try:
+            expansion = checked(requests.post(
+                f"{BASE}/sheets/v2/spreadsheets/{TOKEN}/dimension_range",
+                headers=client._headers(json_body=True),
+                json={"dimension": {"sheetId": sid, "majorDimension": "COLUMNS", "length": extra}},
+                timeout=30))
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError("补充空列请求未确认，本次尚未追加流水") from exc
+        if expansion.get("addCount") != extra:
+            raise RuntimeError("飞书未确认补足列数，本次尚未追加流水")
     last = max(int(grid.get("row_count", 1)), 1)
     col = openpyxl.utils.get_column_letter(width)
     # 整个已分配范围搜索末尾，避免只搜索首行覆盖旧流水。单次请求，不自动重试写入。
