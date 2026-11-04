@@ -127,16 +127,41 @@ def append_archive(client, rows, factory):
     if current_columns < width:
         # 飞书官方增加行列接口：只在右侧添加空列，不改动已有数据。
         extra = width - current_columns
+        problem = None
         try:
             expansion = checked(requests.post(
                 f"{BASE}/sheets/v2/spreadsheets/{TOKEN}/dimension_range",
                 headers=client._headers(json_body=True),
                 json={"dimension": {"sheetId": sid, "majorDimension": "COLUMNS", "length": extra}},
                 timeout=30))
+            if expansion.get("addCount") != extra:
+                problem = "补列返回数量未确认"
         except requests.exceptions.RequestException as exc:
-            raise RuntimeError("补充空列请求未确认，本次尚未追加流水") from exc
-        if expansion.get("addCount") != extra:
-            raise RuntimeError("飞书未确认补足列数，本次尚未追加流水")
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None)
+            problem = f"补列请求异常：{type(exc).__name__}" + (f"，HTTP {status}" if status else "")
+            if response is not None:
+                try:
+                    error = response.json()
+                    problem += f"，code={error.get('code')}，{str(error.get('msg', ''))[:200]}"
+                except (ValueError, AttributeError):
+                    pass
+        except RuntimeError as exc:
+            problem = str(exc)
+        if problem:
+            # 补列的请求可能已经生效。仅重新读取，不重发补列或流水写入。
+            try:
+                latest = checked(requests.get(
+                    f"{BASE}/sheets/v3/spreadsheets/{TOKEN}/sheets/query",
+                    headers=client._headers(), timeout=30))
+                found = next((s for s in latest.get("sheets", []) if s.get("sheet_id") == sid), None)
+                latest_grid = (found or {}).get("grid_properties") or {}
+                actual = latest_grid.get("column_count")
+            except (requests.exceptions.RequestException, RuntimeError):
+                raise RuntimeError(f"{problem}；重新读取列数也失败，本次尚未追加流水")
+            if not isinstance(actual, int) or actual < width:
+                raise RuntimeError(f"{problem}；{sheet['title']}目前{actual}列，需要{width}列，本次尚未追加流水")
+            grid = latest_grid
     last = max(int(grid.get("row_count", 1)), 1)
     col = openpyxl.utils.get_column_letter(width)
     # 整个已分配范围搜索末尾，避免只搜索首行覆盖旧流水。单次请求，不自动重试写入。
