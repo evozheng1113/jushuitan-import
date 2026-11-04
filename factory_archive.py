@@ -3,6 +3,8 @@ from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from io import BytesIO
 import math
+import json
+import re
 import openpyxl
 import requests
 
@@ -13,8 +15,6 @@ ALIASES = {"雅希": {"雅希", "广州", "广州厂", "雅希工厂"},
            "二厂": {"二厂", "二厂工厂", "倾城", "倾诚"},
            "黛宝": {"黛宝", "黛宝工厂"}, "猛哥": {"猛哥", "猛哥工厂"},
            "布心": {"布心", "布心工厂"}}
-HEAD = ["运行时间", "完成文件", "流程", "工厂", "原sheet", "原行号", "下单单号", "证书编号",
-        "总镶嵌成本", "客户名称", "利润", "利润率"]
 
 
 def scalar(value, percent=False):
@@ -32,68 +32,141 @@ def scalar(value, percent=False):
     return value
 
 
+class CompletedSheetRows(list):
+    """接口保持兼容：值就是完成单；格式只保存在内存，不增加可见列。"""
+    def __init__(self):
+        super().__init__()
+        self.styles = []
+        self.merges = []
+        self.heights = []
+        self.widths = {}
+
+
+def rgb(color):
+    if color is not None and color.type == "rgb" and isinstance(color.rgb, str):
+        return "#" + color.rgb[-6:]
+    if color is not None and color.type == "indexed":
+        from openpyxl.styles.colors import COLOR_INDEXED
+        if 0 <= color.indexed < len(COLOR_INDEXED):
+            return "#" + COLOR_INDEXED[color.indexed][-6:]
+    return None
+
+
+def cell_style(cell):
+    style = {"font": {"bold": bool(cell.font.bold), "italic": bool(cell.font.italic)}}
+    if cell.font.sz:
+        style["font"]["fontSize"] = f"{cell.font.sz:g}pt/1.5"
+    foreground = rgb(cell.font.color)
+    background = rgb(cell.fill.fgColor) if cell.fill.patternType == "solid" else None
+    if foreground:
+        style["foreColor"] = foreground
+    if background:
+        style["backColor"] = background
+    if cell.number_format != "General":
+        style["formatter"] = cell.number_format
+    if cell.alignment.horizontal in ("left", "center", "right"):
+        style["hAlign"] = {"left": 0, "center": 1, "right": 2}[cell.alignment.horizontal]
+    if cell.alignment.vertical in ("top", "center", "bottom"):
+        style["vAlign"] = {"top": 0, "center": 1, "bottom": 2}[cell.alignment.vertical]
+    sides = [cell.border.left, cell.border.right, cell.border.top, cell.border.bottom]
+    if all(side is not None and side.style for side in sides):
+        style["borderType"] = "FULL_BORDER"
+        style["borderColor"] = rgb(sides[0].color) or "#000000"
+    return style
+
+
 def snapshot(data, source_path, items, factory, filename, flow):
-    """每次只归档本次解析的行，含完成单原列和明确标注的成本/利润。"""
-    factory = NAMES.get(factory, factory)
-    wb = openpyxl.load_workbook(BytesIO(data), data_only=True)
-    formulas = openpyxl.load_workbook(BytesIO(data), data_only=False)
-    original = openpyxl.load_workbook(source_path, data_only=True)
-    original_formulas = openpyxl.load_workbook(source_path, data_only=False)
-    records = []
-    now = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
-    seen = set()
+    """复制本次完成单的原表块，不添加任何归档字段，不挤掉空列。"""
+    books = []
     try:
-        for it in items:
-            sn = it.get("_sheet") or it.get("_sheet_title")
+        for source, cached in ((BytesIO(data), True), (BytesIO(data), False),
+                               (source_path, True), (source_path, False)):
+            books.append(openpyxl.load_workbook(source, data_only=cached))
+        wb, formulas, original, original_formulas = books
+        grouped = {}
+        for item in items:
+            sn = item.get("_sheet") or item.get("_sheet_title")
             if not sn:
-                sn = wb.sheetnames[-1] if "row" in it else wb.sheetnames[0]
+                sn = wb.sheetnames[-1] if "row" in item else wb.sheetnames[0]
             if sn not in wb.sheetnames:
                 raise ValueError(f"完成单找不到原sheet：{sn}")
-            rows = [it["row"]] if "row" in it else it.get("rows", [])
-            if not rows:
-                raise ValueError("出货记录缺少原行号，未归档")
+            grouped.setdefault(sn, []).append(item)
+        result = CompletedSheetRows()
+        for sn, group in grouped.items():
             ws, fs = wb[sn], formulas[sn]
-            for index, r in enumerate(rows):
-                if (sn, r) in seen:
-                    raise ValueError(f"本次记录重复引用原行：{sn} 第{r}行")
-                seen.add((sn, r))
-                # 带格式的空列不计入宽度。
-                populated = [c for (rr, c), cell in fs._cells.items() if rr == r and cell.value is not None]
-                width = max(populated, default=1)
-                if width > 500:
-                    raise ValueError("原单有效列超过500列，未归档")
-                raw = []
-                for c in range(1, width + 1):
+            populated = [(r, c) for (r, c), cell in fs._cells.items() if cell.value is not None]
+            if not populated:
+                continue
+            start, end = 1, max(r for r, c in populated)
+            if NAMES.get(factory, factory) == "布心":
+                # 与布心解析器一致，最后一个“客户”表头至最后一个“合计”为本次批次。
+                totals = [r for r, c in populated if c == 2 and "合计" in str(fs.cell(r, c).value)]
+                if not totals:
+                    raise ValueError(f"{sn}没有本批合计行，未归档")
+                last_total = max(totals)
+                headers = [r for r, c in populated if c == 2 and r < last_total and str(fs.cell(r, c).value).strip() == "客户"]
+                if not headers:
+                    raise ValueError(f"{sn}没有本批表头，未归档")
+                header = max(headers)
+                dates = [r for r, c in populated if c == 2 and r < header and re.search(r"20\d{2}年\d{1,2}月\d{1,2}日", str(fs.cell(r, c).value))]
+                start = max(dates) if dates else header
+                if any(not (header < it["row"] < last_total) for it in group):
+                    raise ValueError(f"{sn}本次行号与批次边界不符，未归档")
+            relevant = [(r, c) for r, c in populated if start <= r <= end]
+            width = max(c for r, c in relevant)
+            # 保留与内容相交的合并表头/表尾，排除远处仅带格式的空白。
+            merges = [m for m in fs.merged_cells.ranges if m.min_row <= end and m.max_row >= start
+                      and fs.cell(m.min_row, m.min_col).value is not None]
+            for merged in merges:
+                if merged.min_row < start:
+                    raise ValueError(f"{sn}的合并单元格跨批次，未归档")
+                width = max(width, merged.max_col)
+                end = max(end, merged.max_row)
+            if width > 500 or end-start+1 > 4998:
+                raise ValueError("完成单范围过大，未归档，请核对原文件的有效范围")
+            offset = len(result)
+            for r in range(start, end + 1):
+                values = []
+                row_styles = []
+                for c in range(1, width+1):
                     cell = ws.cell(r, c)
-                    value = cell.value
                     formula = fs.cell(r, c)
+                    value = cell.value
                     if formula.data_type == "f" and value is None:
                         if sn in original.sheetnames and original_formulas[sn].cell(r, c).value == formula.value:
                             value = original[sn].cell(r, c).value
                         if value is None:
-                            # 不伪装成零，也不把移位公式写入飞书。
-                            value = "[原表公式无缓存]"
-                    raw.append(scalar(value, "%" in cell.number_format))
-                first = index == 0
-                order = it.get("下单单号") or it.get("飞书匹配键") or it.get("下单编号") or ""
-                customer = it.get("飞书客户名") or (it.get("款号") if "row" in it else "") or ""
-                records.append([now, filename, flow, factory, sn, r, scalar(order), scalar(it.get("证书编号") or it.get("证书号")),
-                                scalar(it.get("镶嵌成本")) if first else "",
-                                scalar(customer), scalar(it.get("飞书利润")) if first else "",
-                                scalar(it.get("飞书利润率"), True) if first else ""] + raw)
-        if not records:
-            raise ValueError("本次没有可归档的出货记录")
-        full_width = max(map(len, records))
-        used = list(range(len(HEAD))) + [c for c in range(len(HEAD), full_width)
-                if any(c < len(r) and r[c] != "" for r in records)]
-        header = HEAD + [f"原表{openpyxl.utils.get_column_letter(c-len(HEAD)+1)}列" for c in used[len(HEAD):]]
-        result = [header] + [[r[c] if c < len(r) else "" for c in used] for r in records]
-        width = len(header)
-        if len(result) > 5000 or width > 100:
-            raise ValueError("本次归档超过单次5000行或100列限制，未写入")
+                            raise ValueError(f"{sn}!{formula.coordinate}公式没有计算结果，无法原样归档；请先用Excel重算保存")
+                    values.append(scalar(value))
+                    row_styles.append(cell_style(formula))
+                result.append(values)
+                # 将同一行相邻的相同样式压成一个范围。
+                left = 1
+                for c in range(2, width+2):
+                    if c == width+1 or row_styles[c-1] != row_styles[left-1]:
+                        result.styles.append((offset+r-start+1, left, c-1, row_styles[left-1]))
+                        left = c
+                height = fs.row_dimensions[r].height or fs.sheet_format.defaultRowHeight or 15
+                result.heights.append((offset+r-start+1, max(1, round(height * 4/3))))
+            for merged in merges:
+                result.merges.append((offset+merged.min_row-start+1, merged.min_col,
+                                      offset+merged.max_row-start+1, merged.max_col))
+            for c in range(1, width+1):
+                # 同工厂同一sheet的列宽为共享属性，记录完成单使用的宽度。
+                dim = next((d for d in fs.column_dimensions.values() if (d.min or 0) <= c <= (d.max or 0)), None)
+                chars = dim.width if dim is not None else fs.sheet_format.defaultColWidth or 8.43
+                result.widths[c] = max(1, round(chars * 7 + 5))
+            result.append([""] * width)  # 两批之间只留一空行，不增加说明文字。
+        if not result:
+            raise ValueError("本次没有可归档的完成单")
+        if len(result) > 5000:
+            raise ValueError("本次完成单超过5000行，未归档")
+        width = max(map(len, result))
+        for row in result:
+            row.extend([""] * (width-len(row)))
         return result
     finally:
-        for book in (wb, formulas, original, original_formulas):
+        for book in books:
             book.close()
 
 
@@ -163,16 +236,68 @@ def append_archive(client, rows, factory):
                 raise RuntimeError(f"{problem}；{sheet['title']}目前{actual}列，需要{width}列，本次尚未追加流水")
             grid = latest_grid
     last = max(int(grid.get("row_count", 1)), 1)
-    col = openpyxl.utils.get_column_letter(width)
+    col = openpyxl.utils.get_column_letter(min(width, 100))
     # 整个已分配范围搜索末尾，避免只搜索首行覆盖旧流水。单次请求，不自动重试写入。
     try:
         result = checked(requests.post(
             f"{BASE}/sheets/v2/spreadsheets/{TOKEN}/values_append?insertDataOption=INSERT_ROWS",
             headers=client._headers(json_body=True),
-            json={"valueRange": {"range": f"{sid}!A1:{col}{last}", "values": rows}}, timeout=60))
+            json={"valueRange": {"range": f"{sid}!A1:{col}{last}", "values": [row[:100] for row in rows]}}, timeout=60))
     except requests.exceptions.RequestException as exc:
         raise RuntimeError("归档请求未获得确认，可能已写入；请先查看工厂流水再决定是否重跑") from exc
     updates = result.get("updates") or {}
     if updates.get("updatedRows") != len(rows):
         raise RuntimeError("飞书未确认完整归档，请检查工厂流水；勿直接重跑")
+    if isinstance(rows, CompletedSheetRows):
+        written_range = updates.get("updatedRange", "")
+        match = re.fullmatch(re.escape(sid) + r"!A(\d+):[A-Z]+(\d+)", written_range)
+        if not match or int(match[2])-int(match[1])+1 != len(rows):
+            raise RuntimeError("流水数据已提交，但返回位置无法确认，未继续设置格式；请勿重跑成本")
+        first_row = int(match[1])
+        try:
+            # 宽表分列写入同一批已追加区域，绝不压缩原来的列位置。
+            for left in range(100, width, 100):
+                right = min(left+100, width)
+                target = f"{sid}!{openpyxl.utils.get_column_letter(left+1)}{first_row}:{openpyxl.utils.get_column_letter(right)}{first_row+len(rows)-1}"
+                checked(requests.put(f"{BASE}/sheets/v2/spreadsheets/{TOKEN}/values",
+                    headers=client._headers(json_body=True),
+                    json={"valueRange": {"range": target, "values": [r[left:right] for r in rows]}}, timeout=60))
+            apply_layout(client, sid, rows, first_row)
+        except Exception as exc:
+            raise RuntimeError(f"流水已追加到{sheet['title']}第{first_row}行起，但原样复制未全部完成：{exc}；请勿重跑，以免重复追加") from exc
     return sheet["title"]
+
+
+def apply_layout(client, sid, rows, first_row):
+    def address(top, left, bottom, right):
+        return f"{sid}!{openpyxl.utils.get_column_letter(left)}{first_row+top-1}:{openpyxl.utils.get_column_letter(right)}{first_row+bottom-1}"
+    base = f"{BASE}/sheets/v2/spreadsheets/{TOKEN}"
+    groups = {}
+    for row, left, right, style in rows.styles:
+        key = json.dumps(style, sort_keys=True)
+        group = groups.setdefault(key, {"ranges": [], "style": style})
+        for c in range(left, right+1, 100):
+            group["ranges"].append(address(row, c, row, min(right, c+99)))
+    batches = []
+    for group in groups.values():
+        for i in range(0, len(group["ranges"]), 100):
+            batches.append({"ranges": group["ranges"][i:i+100], "style": group["style"]})
+    for i in range(0, len(batches), 20):
+        checked(requests.put(base + "/styles_batch_update", headers=client._headers(json_body=True),
+                             json={"data": batches[i:i+20]}, timeout=60))
+    for top, left, bottom, right in rows.merges:
+        checked(requests.post(base + "/merge_cells", headers=client._headers(json_body=True),
+                            json={"range": address(top,left,bottom,right), "mergeType": "MERGE_ALL"}, timeout=30))
+    # 行高只设置新追加部分；列宽是飞书sheet全局属性。
+    for major, dimensions in (("ROWS", rows.heights), ("COLUMNS", sorted(rows.widths.items()))):
+        groups = []
+        for index, pixels in dimensions:
+            index = first_row + index - 1 if major == "ROWS" else index
+            if groups and groups[-1][1] == index-1 and groups[-1][2] == pixels:
+                groups[-1][1] = index
+            else:
+                groups.append([index,index,pixels])
+        for start, end, pixels in groups:
+            checked(requests.put(base + "/dimension_range", headers=client._headers(json_body=True),
+                json={"dimension": {"sheetId": sid, "majorDimension": major, "startIndex": start-1, "endIndex": end},
+                      "dimensionProperties": {"fixedSize": pixels}}, timeout=30))

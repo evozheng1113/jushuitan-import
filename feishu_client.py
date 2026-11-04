@@ -64,6 +64,10 @@ def load_credentials():
     )
 
 
+class QueryTransportError(RuntimeError):
+    """查询未获得有效响应，不应当作订单不存在。"""
+
+
 class FeishuClient:
     def __init__(self, app_id, app_secret):
         self.app_id = app_id
@@ -89,6 +93,32 @@ class FeishuClient:
     def _headers(self):
         return {'Authorization': f'Bearer {self._get_token()}',
                 'Content-Type': 'application/json'}
+
+    def _read_json(self, send, label):
+        """仅用于只读查询。最多尝试3次；业务写入不经过这里。"""
+        reason = ""
+        for attempt in range(3):
+            retryable = True
+            try:
+                response = send()
+                status = response.status_code
+                if not 200 <= status < 300:
+                    reason = f"HTTP {status}"
+                    retryable = status in (408, 429) or status >= 500
+                else:
+                    try:
+                        data = response.json()
+                    except ValueError:
+                        data = None
+                    if isinstance(data, dict):
+                        return data
+                    content_type = response.headers.get("Content-Type", "未知类型")
+                    reason = f"HTTP {status}，返回内容不是有效JSON（{content_type}）"
+            except requests.exceptions.RequestException as exc:
+                reason = type(exc).__name__
+            if not retryable or attempt == 2:
+                raise QueryTransportError(f"{label}失败：{reason}；已尝试{attempt+1}次")
+            time.sleep(0.5 * (attempt+1))
 
     # ============ 通用工具 ============
     @staticmethod
@@ -139,8 +169,8 @@ class FeishuClient:
         """
         url = (f'https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}'
                f'/tables/{table_id}/fields?page_size=100')
-        r = requests.get(url, headers=self._headers(), timeout=10)
-        data = r.json()
+        headers = self._headers()
+        data = self._read_json(lambda: requests.get(url, headers=headers, timeout=10), "读取飞书字段")
         code = data.get('code')
         if code != 0:
             raise RuntimeError(
@@ -170,8 +200,8 @@ class FeishuClient:
                 }],
             }
         }
-        r = requests.post(url, headers=self._headers(), json=body, timeout=10)
-        data = r.json()
+        headers = self._headers()
+        data = self._read_json(lambda: requests.post(url, headers=headers, json=body, timeout=10), "查询飞书订单")
         code = data.get('code')
         if code != 0:
             raise RuntimeError(
@@ -191,6 +221,8 @@ class FeishuClient:
                 rec = self.find_by_field(app_token, table_id, fname, cert)
                 if rec:
                     return rec
+            except QueryTransportError:
+                raise
             except Exception:
                 continue
         return None
