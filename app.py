@@ -26,7 +26,7 @@ st.set_page_config(page_title="聚水潭入库生成", page_icon="💎", layout=
 
 st.title("💎 聚水潭入库 Excel 生成")
 st.caption("上传出货单 → 核对金价 → 生成文件或同步成本")
-st.caption("版本：2026.11.05.1 · 归档格式修复")
+st.caption("版本：2026.11.05.2 · 流水防重复写入")
 
 # ---------------- 飞书工具 ----------------
 def _fetch_after_update(client, key, target_cost, max_wait=4):
@@ -105,6 +105,7 @@ uploaded = st.file_uploader(
     help="支持: 雅希(广州) / 倾诚(二厂) / 黛宝(三厂) / 猛哥(四厂) / 布心(天然钻)"
 )
 
+archive_repeat_key = None
 # 文件历史与成本成功状态分开；记录失败不当成首次上传。
 if uploaded and feishu_ready:
     upload_key = hashlib.sha256(uploaded.getvalue()).hexdigest()
@@ -142,6 +143,10 @@ if uploaded and feishu_ready:
             action_status.warning("上次操作记录保存失败，请重查处理记录。")
         else:
             action_status.info("\n\n".join(status_lines(upload_info)))
+        if upload_info.get('archives'):
+            archive_repeat_key = f"archive_repeat_{upload_key}_{upload_info.get('archive_count', 0)}"
+            st.checkbox("这批工厂单已写过流水，本次确实要再写一份", value=False, key=archive_repeat_key,
+                        help="只影响这一次。请先确认流水里没有这批，或确实需要重复写入。")
     if not upload_info.get('unknown') and not upload_info.get('record_error'):
         if st.button("重查处理记录"):
             upload_cache.pop(upload_key, None)
@@ -244,18 +249,51 @@ def track_bitable_cost(result, total):
 
 
 def archive_completed(data, source_path, items, factory, filename, flow):
+    from factory_archive import ArchiveUncertain, LayoutIncomplete, NAMES
+    from upload_registry import ARCHIVE_BLOCKING, ARCHIVE_LABELS, archive_state, record_action, status_lines
+    name = NAMES.get(factory, factory)
+    info = st.session_state.get('_upload_checks_v3', {}).get(upload_key, {}) if uploaded else {}
+    registry = None
+
+    rows = None
+
+    def note(state):
+        record_action(registry, info, uploaded.name, {'kind': 'archive', 'run_id': current_run_id,
+                                                      'factory': name, 'state': state, 'batch': rows.batch})
+        action_status.info("\n\n".join(status_lines(info)))
+
+    def finish(state):
+        try:
+            note(state)
+        except Exception:
+            # 保留 started 记录，下次按“结果未确认”处理，不会被当成没写过。
+            st.warning("流水结果记录保存失败，再次处理这个文件前请先查看工厂流水。")
+
     try:
         from factory_archive import TOKEN, snapshot, append_archive
         from finished_products import FinishedProductsClient
         rows = snapshot(data, source_path, items, factory, filename, flow)
         app_id, app_secret = load_credentials()
+        client = FinishedProductsClient(app_id, app_secret)
+        previous = archive_state(client, name, rows.batch)
+        repeat = bool(archive_repeat_key and st.session_state.get(archive_repeat_key))
+        if previous in ARCHIVE_BLOCKING and not repeat:
+            info.setdefault('archives', {})[name] = previous  # 别的页面写过时，让确认框显示出来
+            st.warning(f"这批{name}工厂单的流水{ARCHIVE_LABELS[previous]}，本次没有再写入。完成文件仍可下载。"
+                       "如确实要再写一份，先核对流水，勾选上方的确认后重新点开始。")
+            return
+        registry = client
+        note('started')  # 先留记录再写：记录失败就不写，中途断开也能被下次发现。
         archive_client = FinishedProductsClient(app_id, app_secret, spreadsheet_token=TOKEN)
         title = append_archive(archive_client, rows, factory)
+        finish('written')
         st.caption(f"已追加到工厂流水 · {title}")
         if getattr(rows, "format_fallback", False):
             st.caption("部分数字格式飞书不支持，已保留原数值及其他格式。")
     except Exception as exc:
-        from factory_archive import LayoutIncomplete
+        if registry is not None and info.get('archives', {}).get(name) == 'started':
+            finish('layout_incomplete' if isinstance(exc, LayoutIncomplete)
+                   else 'uncertain' if isinstance(exc, ArchiveUncertain) else 'failed')
         if isinstance(exc, LayoutIncomplete):
             st.session_state["archive_pending_layout"] = (exc.rows, factory, exc.first_row)
         st.warning("工厂流水未确认归档，完成文件仍可下载。")

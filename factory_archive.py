@@ -2,6 +2,7 @@
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from io import BytesIO
+import hashlib
 import math
 import json
 import re
@@ -15,6 +16,8 @@ ALIASES = {"雅希": {"雅希", "广州", "广州厂", "雅希工厂"},
            "二厂": {"二厂", "二厂工厂", "倾城", "倾诚"},
            "黛宝": {"黛宝", "黛宝工厂"}, "猛哥": {"猛哥", "猛哥工厂"},
            "布心": {"布心", "布心工厂"}}
+# 这两家一个文件有很多sheet，最后一个才是新出货；其余是历史，不能再次归档。
+LATEST_SHEET_ONLY = {"二厂", "猛哥"}
 
 
 def scalar(value, percent=False):
@@ -40,6 +43,7 @@ class CompletedSheetRows(list):
         self.merges = []
         self.heights = []
         self.widths = {}
+        self.batch = ""  # 本批原始内容的指纹，用来判断同一批是否写过
 
 
 def rgb(color):
@@ -73,6 +77,10 @@ class ArchiveAPIError(RuntimeError):
     def __init__(self, code, message):
         self.code = code
         super().__init__(f"飞书归档失败：{code} {message}")
+
+
+class ArchiveUncertain(RuntimeError):
+    """写入请求已发出但结果未确认，可能已写入，不能当作失败重跑。"""
 
 
 class LayoutIncomplete(RuntimeError):
@@ -116,12 +124,15 @@ def snapshot(data, source_path, items, factory, filename, flow):
         grouped = {}
         for item in items:
             sn = item.get("_sheet") or item.get("_sheet_title")
-            if not sn:
+            if NAMES.get(factory, factory) in LATEST_SHEET_ONLY:
+                sn = wb.sheetnames[-1]
+            elif not sn:
                 sn = wb.sheetnames[-1] if "row" in item else wb.sheetnames[0]
             if sn not in wb.sheetnames:
                 raise ValueError(f"完成单找不到原sheet：{sn}")
             grouped.setdefault(sn, []).append(item)
         result = CompletedSheetRows()
+        batch = hashlib.sha256()
         for sn, group in grouped.items():
             ws, fs = wb[sn], formulas[sn]
             populated = [(r, c) for (r, c), cell in fs._cells.items() if cell.value is not None]
@@ -154,6 +165,11 @@ def snapshot(data, source_path, items, factory, filename, flow):
                 end = max(end, merged.max_row)
             if width > 500 or end-start+1 > 4998:
                 raise ValueError("完成单范围过大，未归档，请核对原文件的有效范围")
+            # 用原出货单计算，金价或成本变化不影响判断；行号取相对值，不受批次位置影响。
+            source = original[sn] if sn in original.sheetnames else ws
+            for (r, c), cell in sorted(source._cells.items()):
+                if start <= r <= end and cell.value is not None:
+                    batch.update(json.dumps([r-start, c, str(cell.value)], ensure_ascii=False).encode())
             offset = len(result)
             for r in range(start, end + 1):
                 values = []
@@ -194,6 +210,7 @@ def snapshot(data, source_path, items, factory, filename, flow):
         width = max(map(len, result))
         for row in result:
             row.extend([""] * (width-len(row)))
+        result.batch = batch.hexdigest()[:32]
         return result
     finally:
         for book in books:
@@ -274,15 +291,15 @@ def append_archive(client, rows, factory):
             headers=client._headers(json_body=True),
             json={"valueRange": {"range": f"{sid}!A1:{col}{last}", "values": [row[:100] for row in rows]}}, timeout=60))
     except requests.exceptions.RequestException as exc:
-        raise RuntimeError("归档请求未获得确认，可能已写入；请先查看工厂流水再决定是否重跑") from exc
+        raise ArchiveUncertain("归档请求未获得确认，可能已写入；请先查看工厂流水再决定是否重跑") from exc
     updates = result.get("updates") or {}
     if updates.get("updatedRows") != len(rows):
-        raise RuntimeError("飞书未确认完整归档，请检查工厂流水；勿直接重跑")
+        raise ArchiveUncertain("飞书未确认完整归档，请检查工厂流水；勿直接重跑")
     if isinstance(rows, CompletedSheetRows):
         written_range = updates.get("updatedRange", "")
         match = re.fullmatch(re.escape(sid) + r"!A(\d+):[A-Z]+(\d+)", written_range)
         if not match or int(match[2])-int(match[1])+1 != len(rows):
-            raise RuntimeError("流水数据已提交，但返回位置无法确认，未继续设置格式；请请勿重跑成本")
+            raise ArchiveUncertain("流水数据已提交，但返回位置无法确认，未继续设置格式；请勿重跑成本")
         first_row = int(match[1])
         try:
             # 宽表分列写入同一批已追加区域，绝不压缩原来的列位置。

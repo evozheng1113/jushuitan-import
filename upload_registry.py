@@ -140,7 +140,7 @@ ACTION_PREFIX = '操作v2:'
 
 
 def action_summary(matches):
-    summary = {'jst_generated': False, 'jst_scopes': [], 'cost_action': None,
+    summary = {'jst_generated': False, 'jst_scopes': [], 'cost_action': None, 'archives': {},
                'legacy_result': any(len(r)>3 and r[3]=='已生成结果' for r in matches)}
     for row in matches:
         if len(row)<4 or not row[3].startswith(ACTION_PREFIX):
@@ -158,7 +158,34 @@ def action_summary(matches):
                 summary['jst_scopes'].append(scope)
         if event.get('kind') == 'cost_sync':
             summary['cost_action'] = event
+        if event.get('kind') == 'archive' and event.get('factory'):
+            summary['archives'][event['factory']] = event.get('state')
     return summary
+
+
+# 这些状态表示流水已写入或可能已写入；started 表示上次开始写入后没有结果。
+ARCHIVE_BLOCKING = {'started', 'written', 'uncertain', 'layout_incomplete'}
+ARCHIVE_LABELS = {'started': '结果未确认', 'uncertain': '结果未确认', 'written': '已写入',
+                  'layout_incomplete': '已写入，格式未完成', 'failed': '写入失败，未写入'}
+
+
+def archive_state(client, factory, batch):
+    """每次写流水前重新读记录表，不用页面缓存；读不到就报错，由调用方放弃写入。
+    按工厂+本批内容判断：文件改名、或老sheet有变动，只要这批没变就算同一批。"""
+    if not batch:
+        raise RuntimeError('本批内容指纹缺失，无法确认是否写过流水')
+    state = None
+    for row in _read(client, _sheet(client))[1:]:
+        if len(row) < 4 or not row[3].startswith(ACTION_PREFIX):
+            continue
+        try:
+            event = json.loads(row[3][len(ACTION_PREFIX):])
+        except (ValueError, TypeError):
+            continue
+        if isinstance(event, dict) and event.get('kind') == 'archive' \
+                and event.get('factory') == factory and event.get('batch') == batch:
+            state = event.get('state')
+    return state
 
 
 def status_lines(info):
@@ -184,7 +211,9 @@ def status_lines(info):
             cost = '本次无可同步项'
         if written or already or failed:
             cost += f'（写入{written} · 已同步跳过{already} · 待核对{failed}）'
-    return [f'聚水潭入库 Excel：{jst}', f'飞书成本同步：{cost}']
+    archives = info.get('archives') or {}
+    archive = '、'.join(f"{name}{ARCHIVE_LABELS.get(state, '状态未知')}" for name, state in archives.items())
+    return [f'聚水潭入库 Excel：{jst}', f'飞书成本同步：{cost}', f"工厂流水：{archive or '无写入记录'}"]
 
 
 def record_action(client, info, filename, event):
@@ -208,6 +237,9 @@ def record_action(client, info, filename, event):
             info['jst_scopes'].append(scope)
     elif event['kind'] == 'cost_sync':
         info['cost_action'] = dict(event)
+    elif event['kind'] == 'archive':
+        info.setdefault('archives', {})[event['factory']] = event['state']
+        info['archive_count'] = info.get('archive_count', 0) + 1
 
 
 class CostProgress:
