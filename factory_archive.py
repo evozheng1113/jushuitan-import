@@ -46,9 +46,9 @@ def rgb(color):
     if color is not None and color.type == "rgb" and isinstance(color.rgb, str):
         return "#" + color.rgb[-6:]
     if color is not None and color.type == "indexed":
-        from openpyxl.styles.colors import COLOR_INDEXED
-        if 0 <= color.indexed < len(COLOR_INDEXED):
-            return "#" + COLOR_INDEXED[color.indexed][-6:]
+        from openpyxl.styles.colors import COLOR_INDEX
+        if 0 <= color.indexed < len(COLOR_INDEX):
+            return "#" + COLOR_INDEX[color.indexed][-6:]
     return None
 
 

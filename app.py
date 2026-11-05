@@ -4,7 +4,7 @@
 - 凭证: Streamlit Cloud Secrets 加密存
 """
 import streamlit as st
-import tempfile, os, traceback, re, time, math, hashlib
+import tempfile, os, traceback, re, time, math, hashlib, uuid
 from datetime import datetime
 
 import factories
@@ -26,7 +26,7 @@ st.set_page_config(page_title="聚水潭入库生成", page_icon="💎", layout=
 
 st.title("💎 聚水潭入库 Excel 生成")
 st.caption("上传出货单 → 核对金价 → 生成文件或同步成本")
-st.caption("版本：2026.11.02")
+st.caption("版本：2026.11.05 · 分项记录")
 
 # ---------------- 飞书工具 ----------------
 def _fetch_after_update(client, key, target_cost, max_wait=4):
@@ -108,7 +108,7 @@ uploaded = st.file_uploader(
 # 文件历史与成本成功状态分开；记录失败不当成首次上传。
 if uploaded and feishu_ready:
     upload_key = hashlib.sha256(uploaded.getvalue()).hexdigest()
-    upload_cache = st.session_state.setdefault('_upload_checks_v2', {})
+    upload_cache = st.session_state.setdefault('_upload_checks_v3', {})
     if upload_key not in upload_cache:
         try:
             from upload_registry import check_and_record
@@ -133,12 +133,19 @@ if uploaded and feishu_ready:
         if st.button("重试保存上传记录"):
             upload_cache.pop(upload_key, None)
             st.rerun()
-    elif upload_info.get('generated'):
-        st.info("已加载过、已跑过（已生成过结果）。可重新生成结果文件；如需重写成本，请勾选同步和覆盖。")
-    elif upload_info.get('seen'):
-        st.warning("已加载过，尚无结果生成记录。可以继续处理。")
     else:
-        st.caption("未找到这份表格的历史上传记录。")
+        st.caption("已加载过" if upload_info.get('seen') else "首次加载")
+    action_status = st.empty()
+    if not upload_info.get('unknown'):
+        from upload_registry import status_lines
+        if upload_info.get('action_record_error'):
+            action_status.warning("上次操作记录保存失败，请重查处理记录。")
+        else:
+            action_status.info("\n\n".join(status_lines(upload_info)))
+    if not upload_info.get('unknown') and not upload_info.get('record_error'):
+        if st.button("重查处理记录"):
+            upload_cache.pop(upload_key, None)
+            st.rerun()
 
 factory_label = st.selectbox(
     "工厂",
@@ -194,21 +201,45 @@ if uploaded and sync_feishu and ('ZC' in uploaded.name.upper() or '布心' in fa
         buxin_initial['18K'] = st.checkbox("确认 18K 最后一批尚未同步，允许更新已有成本", key='buxin_18k_' + hashlib.sha256(uploaded.getvalue()).hexdigest())
 
 
-def remember_generated():
-    """仅在结果文件生成后记录；不标记飞书成本已成功同步。"""
+def remember_action(event):
     if not uploaded or not feishu_ready:
         return
-    info = st.session_state.get('_upload_checks_v2', {}).get(upload_key, {})
-    if not info or info.get('unknown') or info.get('generated'):
-        return
+    info = st.session_state.get('_upload_checks_v3', {}).get(upload_key, {})
     try:
-        from upload_registry import record_generated
+        from upload_registry import record_action, status_lines
         from finished_products import FinishedProductsClient
         log_id, log_secret = load_credentials()
-        record_generated(FinishedProductsClient(log_id, log_secret), info, uploaded.name)
+        record_action(FinishedProductsClient(log_id, log_secret), info, uploaded.name, event)
+        info.pop('action_record_error', None)
+        action_status.info("\n\n".join(status_lines(info)))
     except Exception:
-        st.caption("结果已生成，但运行记录暂未保存。")
+        info['action_record_error'] = True
+        action_status.warning("本次操作记录未保存，状态待核对。")
 
+
+def remember_generated(kind='complete', scope=''):
+    # 只有真正生成聚水潭入库文件，才能设置该项状态。
+    if kind == 'jst':
+        remember_action({'kind':'jst_generated', 'run_id':current_run_id, 'scope':scope})
+
+
+def track_cost(total, written=0, already=0):
+    if cost_progress is not None:
+        cost_progress.add(total, written, already)
+        remember_action(cost_progress.event())
+
+
+def track_sheet_cost(result, total):
+    from upload_registry import sheet_confirmed
+    confirmed = sheet_confirmed(result)
+    track_cost(total, len(result.get('matched', [])) if confirmed else 0)
+    if result.get('matched') and not confirmed:
+        st.warning("成品成本写入未获成功确认，请核对，勿当作已同步。")
+
+
+def track_bitable_cost(result, total):
+    from upload_registry import already_synced
+    track_cost(total, result.get('updated', 0), already_synced(result))
 
 
 
@@ -325,6 +356,7 @@ def sync_zhencheng_finished_items(items):
                 ]
                 with st.spinner("正在同步成品成本…"):
                     zc_res = sync_costs(zc_client, sync_items, cost_col_letter='M', overwrite=overwrite)
+                track_sheet_cost(zc_res, len(spot_items))
                 st.success(f"✅ 匹配 **{len(zc_res['matched'])}** 条 / 提交 {len(sync_items)} 条")
                 if zc_res['unmatched']:
                     st.warning(f"⚠️ {len(zc_res['unmatched'])} 条没匹配到: "
@@ -340,6 +372,7 @@ def sync_zhencheng_finished_items(items):
                                 f"{col} {m['old_m']} → {m['new_m']}"
                                 + (f"  H '{m['old_h']}' → '{m['new_h']}'" if m.get('new_h') else ''))
         except Exception as e:
+            track_cost(len(spot_items))
             st.error(f"❌ 同步真诚现货到真诚成品新单失败: {e}")
             with st.expander("详细错误"):
                 st.code(traceback.format_exc())
@@ -361,6 +394,7 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
                 if factory_name == '布心':
                     item['_布心首次确认'] = buxin_initial.get(item.get('材质颜色'), False)
         except Exception as e:
+            if sync_feishu: track_cost(1)
             st.error(f"❌ 解析失败: {e}")
             with st.expander("详细错误"):
                 st.code(traceback.format_exc())
@@ -393,6 +427,7 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
                    f"只查当年 ({datetime.now().year}) → {len(order_sheets)} 个: "
                    + ' / '.join(s.get('title', '') for s in order_sheets))
     except Exception as e:
+        if sync_feishu: track_cost(max(1, len(items)))
         st.error(f"❌ GIA 库存查询初始化失败: {e}")
         return 0
 
@@ -442,37 +477,38 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
         progress.progress((i + 1) / len(items))
     progress.empty()
 
-    # 生成 xlsx
-    jst_rows = [natural.build_jst_row(it, it['_gia'], factory_name) for it in items]
-    out_path = tempfile.mktemp(suffix='.xlsx')
-    date_str = datetime.now().strftime('%m-%d')
-    natural.gen_jst_xlsx(jst_rows, out_path, sheet_title=f'{factory_name}真诚{date_str}')
-    with open(out_path, 'rb') as f:
-        data = f.read()
-    try: os.unlink(out_path)
-    except OSError: pass
+    if do_jst:
+        # 生成 xlsx
+        jst_rows = [natural.build_jst_row(it, it['_gia'], factory_name) for it in items]
+        out_path = tempfile.mktemp(suffix='.xlsx')
+        date_str = datetime.now().strftime('%m-%d')
+        natural.gen_jst_xlsx(jst_rows, out_path, sheet_title=f'{factory_name}真诚{date_str}')
+        with open(out_path, 'rb') as f:
+            data = f.read()
+        try: os.unlink(out_path)
+        except OSError: pass
 
-    red_count = sum(1 for r in jst_rows if r.get('_红底'))
-    if red_count:
-        st.warning(f"⚠️ {red_count} 件多散货, 客户名已标红 — 请人工核验")
+        red_count = sum(1 for r in jst_rows if r.get('_红底'))
+        if red_count:
+            st.warning(f"⚠️ {red_count} 件多散货, 客户名已标红 — 请人工核验")
 
-    fname = f'聚水潭_{factory_name}真诚_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
-    st.download_button(
-        f"📥 下载 {factory_name} 真诚聚水潭 ({len(items)} 件)",
-        data=data, file_name=fname,
-        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        type="primary",
-        key=f'dl_nat_{factory_name}_{datetime.now().timestamp()}',
-    )
-    remember_generated()
-    st.session_state.setdefault('history', []).append({
-        '时间': datetime.now().strftime('%H:%M:%S'),
-        '类型': f'聚水潭-{factory_name}真诚',
-        '工厂': factory_name,
-        '件数': len(items),
-        '文件名': fname,
-        '_data': data,
-    })
+        fname = f'聚水潭_{factory_name}真诚_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
+        st.download_button(
+            f"📥 下载 {factory_name} 真诚聚水潭 ({len(items)} 件)",
+            data=data, file_name=fname,
+            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            type="primary",
+            key=f'dl_nat_{factory_name}_{datetime.now().timestamp()}',
+        )
+        remember_generated("jst", factory_name + "真诚")
+        st.session_state.setdefault('history', []).append({
+            '时间': datetime.now().strftime('%H:%M:%S'),
+            '类型': f'聚水潭-{factory_name}真诚',
+            '工厂': factory_name,
+            '件数': len(items),
+            '文件名': fname,
+            '_data': data,
+        })
 
     # v23: 同步镶嵌成本到真诚部门多维表格 (绑定"同步今日成本到飞书"复选框)
     if sync_feishu:
@@ -488,6 +524,7 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
                 bitable_client = FeishuClient(app_id, app_secret)
                 sync_result = sync_zhencheng_costs(bitable_client, bitable_items)
 
+            track_bitable_cost(sync_result, len(bitable_items))
             skipped = sum(d.get('status') == 'skip' for d in sync_result['details'])
             attention = len(sync_result['not_found']) + len(sync_result['errors'])
             st.info(f"成功 {sync_result['updated']} 笔 · 跳过 {skipped} 笔 · 需要核对 {attention} 笔")
@@ -574,6 +611,7 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
                     st.warning(f"生成利润简报失败 (不影响主流程): {e}")
 
         except Exception as e:
+            track_cost(len([it for it in items if it.get("类别") != "部门-真诚-现货"]))
             st.error(f"❌ 同步真诚多维表失败: {e}")
             with st.expander("详细错误"):
                 st.code(traceback.format_exc())
@@ -631,6 +669,12 @@ if uploaded is not None:
 # ---------------- 主流程 ----------------
 # v15: 只要有上传文件就能跑 (即使两个附加任务都没勾, 工厂单完成文件也会生成)
 if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
+    from upload_registry import CostProgress
+    current_run_id = uuid.uuid4().hex
+    cost_progress = CostProgress(current_run_id) if sync_feishu else None
+    run_complete = False
+    if cost_progress is not None:
+        remember_action(cost_progress.event())
     try:
         suffix = '.xlsx'
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
@@ -677,6 +721,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                                  gia_months=GIA_MONTHS, sync_feishu=sync_feishu)
             try: os.unlink(in_path)
             except OSError: pass
+            run_complete = True
             st.stop()
 
         default_material = detect_default_material(uploaded.name)
@@ -855,6 +900,9 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                 if write_fails: summary += f" | 失败 {len(write_fails)}"
             st.success(summary)
 
+        if sync_feishu:
+            track_cost(len(clients), write_ok)
+
         # ============== v13: 生成入库 Excel (只在勾选时) ==============
         if do_jst:
             st.subheader("📦 生成聚水潭入库 Excel")
@@ -908,7 +956,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                     type="primary",
                     key=f'dl_jst_{datetime.now().timestamp()}',
                 )
-                remember_generated()
+                remember_generated("jst", code + "常规")
                 # session 历史 (聚水潭)
                 st.session_state.setdefault('history', []).append({
                     '时间': datetime.now().strftime('%H:%M:%S'),
@@ -973,6 +1021,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                 run_natural_workflow(in_path, uploaded.name, '猛哥', pt, au,
                                      gia_months=GIA_MONTHS, sync_feishu=sync_feishu, sync_zc_spots=False)
             except Exception as e:
+                if sync_feishu: track_cost(1)
                 st.error(f"❌ 天然钻流程失败: {e}")
                 with st.expander("详细错误"):
                     st.code(traceback.format_exc())
@@ -1002,6 +1051,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                     st.subheader(f"🔗 真诚(19楼)培育件 → 真诚多维表 ({len(zc_pei_items)} 件)")
                     with st.spinner("同步真诚培育件..."):
                         zc_res = sync_zhencheng_costs(_client, zc_pei_items)
+                    track_bitable_cost(zc_res, len(zc_pei_items))
                     st.success(
                         f"✅ 匹配 **{zc_res['matched']}** / 写入 **{zc_res['updated']}** "
                         f"| 证书=`{zc_res.get('cert_field') or '(无)'}` "
@@ -1026,6 +1076,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                             if d.get('reason'): line += f" ({d['reason']})"
                             st.text(line)
                 except Exception as e:
+                    track_cost(len(zc_pei_items))
                     st.error(f"❌ 同步真诚培育件失败: {e}")
                     with st.expander("详细错误"):
                         st.code(traceback.format_exc())
@@ -1044,11 +1095,13 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                         _client.app_id, _client.app_secret)
                     with st.spinner(f"正在同步成品成本…"):
                         result = sync_costs(fp_client, sync_items, overwrite=overwrite)
+                    track_sheet_cost(result, len(sync_items))
                     matched = result['matched']
                     unmatched = result['unmatched']
                     errors = result['errors']
 
-                    if matched:
+                    from upload_registry import sheet_confirmed
+                    if matched and sheet_confirmed(result):
                         h_updated = sum(1 for m in matched if m.get('new_h') is not None)
                         st.success(
                             f"✅ 命中 {len(matched)} 条, M 列已更新"
@@ -1075,6 +1128,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                         for e in errors:
                             st.error(f"❌ {e}")
             except Exception as e:
+                track_cost(max(1, len(locals().get("sync_items", []))))
                 st.error(f"❌ 同步成品新单失败: {e}")
                 with st.expander("详细错误"):
                     st.code(traceback.format_exc())
@@ -1090,6 +1144,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                 st.divider()
                 st.info(f"ℹ️ 有 {len(sync_items_preview)} 条现货可同步到成品新单 (勾选「✏️ 同步今日成本到飞书」后才写入)")
 
+        run_complete = True
         try:
             os.unlink(in_path)
         except OSError:
@@ -1099,6 +1154,9 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
         st.error(f"❌ 出错: {e}")
         with st.expander("详细错误"):
             st.code(traceback.format_exc())
+    finally:
+        if cost_progress is not None:
+            remember_action(cost_progress.event(complete=run_complete))
 
 # ---------------- 本次会话历史 ----------------
 st.divider()

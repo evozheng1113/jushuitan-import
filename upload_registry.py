@@ -112,6 +112,7 @@ def check_and_record(client, data, filename):
     matches = [r for r in rows[1:] if r and (r[0] == content or (len(r) > 4 and r[4] == raw))]
     info = {'seen': bool(matches), 'generated': any(len(r) > 3 and r[3] == '已生成结果' for r in matches),
             'content': content, 'raw': raw, 'sheet': sheet}
+    info.update(action_summary(matches))
     if not matches:
         try:
             _append(client, sheet, ([] if rows else [HEADER]) + [_row(content, raw, filename, '已加载')])
@@ -133,3 +134,106 @@ def record_generated(client, info, filename):
     else:
         _append(client, info['sheet'], [_row(info['content'], info['raw'], filename, '已生成结果')])
     info['generated'] = True
+
+
+ACTION_PREFIX = '操作v2:'
+
+
+def action_summary(matches):
+    summary = {'jst_generated': False, 'jst_scopes': [], 'cost_action': None,
+               'legacy_result': any(len(r)>3 and r[3]=='已生成结果' for r in matches)}
+    for row in matches:
+        if len(row)<4 or not row[3].startswith(ACTION_PREFIX):
+            continue
+        try:
+            event = json.loads(row[3][len(ACTION_PREFIX):])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get('kind') == 'jst_generated':
+            summary['jst_generated'] = True
+            scope = event.get('scope', '')
+            if scope and scope not in summary['jst_scopes']:
+                summary['jst_scopes'].append(scope)
+        if event.get('kind') == 'cost_sync':
+            summary['cost_action'] = event
+    return summary
+
+
+def status_lines(info):
+    legacy = info.get('legacy_result', False)
+    if info.get('jst_generated'):
+        jst = '已生成' + ('（'+'、'.join(info.get('jst_scopes', []))+'）' if info.get('jst_scopes') else '')
+    else:
+        jst = '旧记录未区分' if legacy else '无生成记录'
+    event = info.get('cost_action')
+    if not event:
+        cost = '旧记录未区分' if legacy else '无同步记录'
+    else:
+        written, already, failed = (event.get(k, 0) for k in ('written', 'already', 'failed'))
+        if not event.get('complete'):
+            cost = '结果未确认（处理中或中断）'
+        elif failed:
+            cost = '部分成功' if written or already else '未获成功确认'
+        elif written:
+            cost = '全部成功'
+        elif already:
+            cost = '已同步，本次跳过'
+        else:
+            cost = '本次无可同步项'
+        if written or already or failed:
+            cost += f'（写入{written} · 已同步跳过{already} · 待核对{failed}）'
+    return [f'聚水潭入库 Excel：{jst}', f'飞书成本同步：{cost}']
+
+
+def record_action(client, info, filename, event):
+    if info.get('unknown') or not info.get('content'):
+        raise RuntimeError('文件记录不可用，无法保存分项操作状态')
+    status = ACTION_PREFIX + json.dumps(event, ensure_ascii=False, separators=(',', ':'))
+    sheet = info.get('sheet')
+    if info.get('record_error') or not sheet:
+        sheet = _sheet(client)
+        rows = _read(client, sheet)
+        prefix = [] if rows else [HEADER]
+    else:
+        prefix = []
+    _append(client, sheet, prefix + [_row(info['content'], info['raw'], filename, status)])
+    info['sheet'] = sheet
+    info.pop('record_error', None)
+    if event['kind'] == 'jst_generated':
+        info['jst_generated'] = True
+        scope = event.get('scope', '')
+        if scope and scope not in info.setdefault('jst_scopes', []):
+            info['jst_scopes'].append(scope)
+    elif event['kind'] == 'cost_sync':
+        info['cost_action'] = dict(event)
+
+
+class CostProgress:
+    def __init__(self, run_id):
+        self.run_id = run_id
+        self.written = self.already = self.failed = 0
+
+    def add(self, total, written=0, already=0):
+        written = max(0, min(int(written), int(total)))
+        already = max(0, min(int(already), int(total)-written))
+        self.written += written
+        self.already += already
+        self.failed += max(0, int(total)-written-already)
+
+    def event(self, complete=False):
+        return {'kind':'cost_sync', 'run_id':self.run_id, 'written':self.written,
+                'already':self.already, 'failed':self.failed, 'complete':bool(complete)}
+
+
+def sheet_confirmed(result):
+    """匹配日志不等于写入确认；检查真实API回执，而不是包装层的code。"""
+    response = result.get('response') or {}
+    replies = response.get('responses') or []
+    return bool(replies) and response.get('code') == 0 and all(r.get('code') == 0 for r in replies)
+
+
+def already_synced(result):
+    return sum(d.get('status') == 'skip' and '已同步' in str(d.get('reason', ''))
+               for d in result.get('details', []))
