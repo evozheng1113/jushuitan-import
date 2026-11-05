@@ -26,7 +26,7 @@ st.set_page_config(page_title="聚水潭入库生成", page_icon="💎", layout=
 
 st.title("💎 聚水潭入库 Excel 生成")
 st.caption("上传出货单 → 核对金价 → 生成文件或同步成本")
-st.caption("版本：2026.11.05 · 分项记录")
+st.caption("版本：2026.11.05 · 归档格式修复")
 
 # ---------------- 飞书工具 ----------------
 def _fetch_after_update(client, key, target_cost, max_wait=4):
@@ -252,10 +252,62 @@ def archive_completed(data, source_path, items, factory, filename, flow):
         archive_client = FinishedProductsClient(app_id, app_secret, spreadsheet_token=TOKEN)
         title = append_archive(archive_client, rows, factory)
         st.caption(f"已追加到工厂流水 · {title}")
+        if getattr(rows, "format_fallback", False):
+            st.caption("部分数字格式飞书不支持，已保留原数值及其他格式。")
     except Exception as exc:
+        from factory_archive import LayoutIncomplete
+        if isinstance(exc, LayoutIncomplete):
+            st.session_state["archive_pending_layout"] = (exc.rows, factory, exc.first_row)
         st.warning("工厂流水未确认归档，完成文件仍可下载。")
         with st.expander("查看归档原因"):
             st.write(str(exc))
+
+# Repair operates independently of Start and never invokes cost synchronization.
+with st.expander("仅修复归档格式"):
+    st.caption("用于流水已追加、格式失败的批次。上传当次工厂单完成文件，核对一致后修复原位置。")
+    if st.session_state.get("archive_pending_layout") and st.button("修复本页刚才失败的批次"):
+        try:
+            from factory_archive import TOKEN, repair_layout
+            from finished_products import FinishedProductsClient
+            pending_rows, pending_factory, pending_start = st.session_state["archive_pending_layout"]
+            aid, secret = load_credentials()
+            repair_layout(FinishedProductsClient(aid, secret, spreadsheet_token=TOKEN), pending_rows, pending_factory, pending_start)
+            del st.session_state["archive_pending_layout"]
+            st.success("原位置格式已修复，未追加流水、未写入成本。")
+        except Exception as exc:
+            st.error(str(exc))
+    repair_source = st.file_uploader("原出货单（完成文件含公式时用于读取原计算结果）", type=["xlsx"], key="archive_repair_source")
+    repair_file = st.file_uploader("工厂单完成文件", type=["xlsx"], key="archive_repair_file")
+    repair_factory = st.selectbox("归档工厂", ["A", "B", "D", "E", "BUXIN"],
+        format_func=lambda v: {"A":"广州", "B":"二厂", "D":"黛宝", "E":"猛哥", "BUXIN":"布心"}[v], key="archive_repair_factory")
+    repair_start = st.number_input("提示中的起始行", min_value=1, value=1, step=1, key="archive_repair_start")
+    repair_sheets = []
+    if repair_file is not None:
+        try:
+            import openpyxl as repair_xl
+            from io import BytesIO as RepairBytesIO
+            repair_book = repair_xl.load_workbook(RepairBytesIO(repair_file.getvalue()), read_only=True)
+            repair_sheets = st.multiselect("本次归档的sheet（保持原顺序）", repair_book.sheetnames, default=repair_book.sheetnames)
+            repair_book.close()
+        except Exception as exc:
+            st.error(f"无法读取完成文件：{exc}")
+    if st.button("核对并仅修复格式", disabled=not repair_sheets):
+        try:
+            from factory_archive import TOKEN, snapshot, repair_layout
+            from finished_products import FinishedProductsClient
+            raw = repair_file.getvalue()
+            # Completed files with missing formula caches must be recalculated first;
+            # never guess values or mutate a non-matching region.
+            repair_rows = snapshot(raw, RepairBytesIO(repair_source.getvalue() if repair_source else raw), [{"_sheet": n} for n in repair_sheets],
+                "完成文件", repair_file.name, "格式修复")
+            aid, secret = load_credentials()
+            target = FinishedProductsClient(aid, secret, spreadsheet_token=TOKEN)
+            title = repair_layout(target, repair_rows, repair_factory, int(repair_start))
+            st.success(f"已修复{title}原位置格式，未追加流水、未写入成本。")
+            if getattr(repair_rows, "format_fallback", False):
+                st.caption("部分数字格式飞书不支持，已保留原数值及其他格式。")
+        except Exception as exc:
+            st.error(str(exc))
 
 # ---------------- 工厂识别 ----------------
 FACTORY_HINTS = [

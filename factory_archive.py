@@ -52,6 +52,35 @@ def rgb(color):
     return None
 
 
+def compatible_formatter(fmt):
+    """Only send simple numeric patterns, never Excel locale/accounting syntax."""
+    if not fmt or fmt == "General":
+        return None
+    section = fmt.split(";")[0]
+    section = re.sub(r"\[[^\]]*\]", "", section)
+    if re.search(r"[ymdhs]", section, re.I):
+        return None  # dates are already ISO strings
+    if "%" in section:
+        match = re.search(r"0\.([0#]+)", section)
+        return "0" + ("." + "0" * min(len(match[1]), 8) if match else "") + "%"
+    match = re.fullmatch(r"(?:#,##)?0(?:\.([0#]{1,8}))?", section)
+    if match:
+        return section
+    return None
+
+
+class ArchiveAPIError(RuntimeError):
+    def __init__(self, code, message):
+        self.code = code
+        super().__init__(f"飞书归档失败：{code} {message}")
+
+
+class LayoutIncomplete(RuntimeError):
+    def __init__(self, title, sid, first_row, rows, cause):
+        self.sid, self.first_row, self.rows = sid, first_row, rows
+        super().__init__(f"流水已追加到{title}第{first_row}行起，格式未完成：{cause}；请使用仅修复归档格式，请勿重跑成本")
+
+
 def cell_style(cell):
     style = {"font": {"bold": bool(cell.font.bold), "italic": bool(cell.font.italic)}}
     if cell.font.sz:
@@ -62,8 +91,9 @@ def cell_style(cell):
         style["foreColor"] = foreground
     if background:
         style["backColor"] = background
-    if cell.number_format != "General":
-        style["formatter"] = cell.number_format
+    formatter = compatible_formatter(cell.number_format)
+    if formatter:
+        style["formatter"] = formatter
     if cell.alignment.horizontal in ("left", "center", "right"):
         style["hAlign"] = {"left": 0, "center": 1, "right": 2}[cell.alignment.horizontal]
     if cell.alignment.vertical in ("top", "center", "bottom"):
@@ -174,7 +204,7 @@ def checked(response):
     response.raise_for_status()
     payload = response.json()
     if payload.get("code") != 0:
-        raise RuntimeError(f"飞书归档失败：{payload.get('code')} {payload.get('msg', '')}")
+        raise ArchiveAPIError(payload.get("code"), payload.get("msg", ""))
     return payload.get("data") or {}
 
 
@@ -252,7 +282,7 @@ def append_archive(client, rows, factory):
         written_range = updates.get("updatedRange", "")
         match = re.fullmatch(re.escape(sid) + r"!A(\d+):[A-Z]+(\d+)", written_range)
         if not match or int(match[2])-int(match[1])+1 != len(rows):
-            raise RuntimeError("流水数据已提交，但返回位置无法确认，未继续设置格式；请勿重跑成本")
+            raise RuntimeError("流水数据已提交，但返回位置无法确认，未继续设置格式；请请勿重跑成本")
         first_row = int(match[1])
         try:
             # 宽表分列写入同一批已追加区域，绝不压缩原来的列位置。
@@ -264,7 +294,7 @@ def append_archive(client, rows, factory):
                     json={"valueRange": {"range": target, "values": [r[left:right] for r in rows]}}, timeout=60))
             apply_layout(client, sid, rows, first_row)
         except Exception as exc:
-            raise RuntimeError(f"流水已追加到{sheet['title']}第{first_row}行起，但原样复制未全部完成：{exc}；请勿重跑，以免重复追加") from exc
+            raise LayoutIncomplete(sheet["title"], sid, first_row, rows, exc) from exc
     return sheet["title"]
 
 
@@ -283,8 +313,19 @@ def apply_layout(client, sid, rows, first_row):
         for i in range(0, len(group["ranges"]), 100):
             batches.append({"ranges": group["ranges"][i:i+100], "style": group["style"]})
     for i in range(0, len(batches), 20):
-        checked(requests.put(base + "/styles_batch_update", headers=client._headers(json_body=True),
-                             json={"data": batches[i:i+20]}, timeout=60))
+        batch = batches[i:i+20]
+        try:
+            checked(requests.put(base + "/styles_batch_update", headers=client._headers(json_body=True),
+                                 json={"data": batch}, timeout=60))
+        except ArchiveAPIError as exc:
+            if str(exc.code) != "90204" or "invalid formatter" not in str(exc).lower() or not any("formatter" in g["style"] for g in batch):
+                raise
+            # Style assignment is idempotent. Retry only the rejected styles,
+            # never append or rewrite business costs. Preserve all other style fields.
+            plain = [{"ranges": g["ranges"], "style": {k:v for k,v in g["style"].items() if k != "formatter"}} for g in batch]
+            checked(requests.put(base + "/styles_batch_update", headers=client._headers(json_body=True),
+                                 json={"data": plain}, timeout=60))
+            rows.format_fallback = True
     for top, left, bottom, right in rows.merges:
         checked(requests.post(base + "/merge_cells", headers=client._headers(json_body=True),
                             json={"range": address(top,left,bottom,right), "mergeType": "MERGE_ALL"}, timeout=30))
@@ -301,3 +342,35 @@ def apply_layout(client, sid, rows, first_row):
             checked(requests.put(base + "/dimension_range", headers=client._headers(json_body=True),
                 json={"dimension": {"sheetId": sid, "majorDimension": major, "startIndex": start-1, "endIndex": end},
                       "dimensionProperties": {"fixedSize": pixels}}, timeout=30))
+
+
+def repair_layout(client, rows, factory, first_row):
+    """Read/compare the full existing block before any layout mutation. No append."""
+    if client.spreadsheet_token != TOKEN or not isinstance(first_row, int) or first_row < 1:
+        raise ValueError("修复目标不正确")
+    listing = checked(requests.get(f"{BASE}/sheets/v3/spreadsheets/{TOKEN}/sheets/query", headers=client._headers(), timeout=30))
+    name = NAMES.get(factory, factory)
+    matches = [s for s in listing.get("sheets", []) if s.get("title", "").strip() in ALIASES.get(name, {name})]
+    if len(matches) != 1:
+        raise ValueError("无法唯一确定修复的工厂sheet")
+    sid = matches[0]["sheet_id"]
+    width = max(map(len, rows))
+    # Read unformatted values to compare numbers rather than currency display strings.
+    for start in range(0, len(rows), 200):
+        block = rows[start:start+200]
+        for left in range(0, width, 100):
+            right = min(left+100, width)
+            area = f"{sid}!{openpyxl.utils.get_column_letter(left+1)}{first_row+start}:{openpyxl.utils.get_column_letter(right)}{first_row+start+len(block)-1}"
+            data = checked(requests.get(f"{BASE}/sheets/v2/spreadsheets/{TOKEN}/values/{area}", headers=client._headers(), params={"valueRenderOption":"UnformattedValue"}, timeout=30))
+            actual = data.get("valueRange", {}).get("values")
+            if actual is None:
+                raise ValueError("无法核对已有流水，未修改格式")
+            for r, expected in enumerate(block):
+                line = actual[r] if r < len(actual) else []
+                for c in range(left, right):
+                    got = line[c-left] if c-left < len(line) else ""
+                    want = expected[c]
+                    if (got if got is not None else "") != (want if want is not None else ""):
+                        raise ValueError(f"第{first_row+start+r}行第{c+1}列与完成文件不一致，未修改；请核对文件、sheet和起始行")
+    apply_layout(client, sid, rows, first_row)
+    return matches[0]["title"]
