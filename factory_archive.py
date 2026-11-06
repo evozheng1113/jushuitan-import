@@ -22,6 +22,8 @@ ALIASES = {"雅希": {"雅希", "广州", "广州厂", "雅希工厂"},
 STRAY_GAP = 20
 # 这两家一个文件有很多sheet，最后一个才是新出货；其余是历史，不能再次归档。
 LATEST_SHEET_ONLY = {"二厂", "猛哥"}
+# 这些工厂的货品图放进单元格。布心等的图片不是货品图，不复制。
+IMAGE_FACTORIES = {"雅希"}
 
 
 def date_text(value, fmt):
@@ -62,6 +64,8 @@ class CompletedSheetRows(list):
         self.heights = []
         self.widths = {}
         self.batch = ""  # 本批原始内容的指纹，用来判断同一批是否写过
+        self.images = []  # (本批内0起的行, 列号, 图片内容, 文件名)
+        self.image_failed = 0
         self.old_dates = {}  # 旧版把日期写成完整时间，修复格式时仍要认得出
 
 
@@ -158,6 +162,37 @@ def cell_style(cell):
     return style
 
 
+def sheet_images(ws, offset, start, end, width):
+    """取本批范围内的图片。图片要落在合并格的左上角，同一格只放第一张。"""
+    found, used = [], set()
+    merged = {(r, c): (m.min_row, m.min_col) for m in ws.merged_cells.ranges
+              for r in range(m.min_row, m.max_row+1) for c in range(m.min_col, m.max_col+1)}
+    for image in ws._images:
+        anchor = getattr(image.anchor, "_from", None)
+        if anchor is None:
+            continue
+        row, col = merged.get((anchor.row+1, anchor.col+1), (anchor.row+1, anchor.col+1))
+        if not start <= row <= end or col > width or (row, col) in used or ws.cell(row, col).value is not None:
+            continue  # 写图片会盖掉格子内容，有内容的格子不写
+        used.add((row, col))
+        found.append((offset+row-start, col, image._data(), f"{row}_{col}.{image.format or 'png'}"))
+    return found
+
+
+def write_images(client, sid, rows, first_row):
+    """图片失败只记数，数字文字已写好，这里绝不抛错。"""
+    failed = 0
+    for index, col, data, name in rows.images:
+        cell = f"{openpyxl.utils.get_column_letter(col)}{first_row+index}"
+        try:
+            layout_call("post", f"{BASE}/sheets/v2/spreadsheets/{TOKEN}/values_image",
+                        headers=client._headers(json_body=True),
+                        json={"range": f"{sid}!{cell}:{cell}", "image": list(data), "name": name}, timeout=60)
+        except (ArchiveAPIError, requests.exceptions.RequestException, ValueError):
+            failed += 1
+    rows.image_failed = failed
+
+
 def snapshot(data, source_path, items, factory, filename, flow):
     """复制本次完成单的原表块，不添加任何归档字段，不挤掉空列。"""
     books = []
@@ -220,6 +255,8 @@ def snapshot(data, source_path, items, factory, filename, flow):
                 if start <= r <= end and cell.value is not None:
                     batch.update(json.dumps([r-start, c, str(cell.value)], ensure_ascii=False).encode())
             offset = len(result)
+            if NAMES.get(factory, factory) in IMAGE_FACTORIES:
+                result.images.extend(sheet_images(source, offset, start, end, width))
             for r in range(start, end + 1):
                 values = []
                 row_styles = []
@@ -293,6 +330,8 @@ def layout_call(method, url, **kwargs):
 
 
 def same_value(got, want):
+    if isinstance(got, (list, dict)) and want in ("", None):
+        return True  # 空格子里读到对象，是写进去的图片
     if isinstance(got, (int, float)) and isinstance(want, (int, float)):
         return abs(got - want) < 1e-6
     return str("" if got is None else got) == str("" if want is None else want)
@@ -382,6 +421,7 @@ def append_archive(client, rows, factory):
         if not match or int(match[2])-int(match[1])+1 != len(rows):
             raise ArchiveUncertain("流水数据已提交，但返回位置无法确认，未继续设置格式；请勿重跑成本")
         first_row = int(match[1])
+        layout_error = None
         try:
             # 宽表分列写入同一批已追加区域，绝不压缩原来的列位置。
             for left in range(100, width, 100):
@@ -392,7 +432,10 @@ def append_archive(client, rows, factory):
                     json={"valueRange": {"range": target, "values": [r[left:right] for r in rows]}}, timeout=60))
             apply_layout(client, sid, rows, first_row)
         except Exception as exc:
-            raise LayoutIncomplete(sheet["title"], sid, first_row, rows, exc) from exc
+            layout_error = exc
+        write_images(client, sid, rows, first_row)
+        if layout_error is not None:
+            raise LayoutIncomplete(sheet["title"], sid, first_row, rows, layout_error) from layout_error
     return sheet["title"]
 
 

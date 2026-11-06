@@ -26,7 +26,7 @@ st.set_page_config(page_title="聚水潭入库生成", page_icon="💎", layout=
 
 st.title("💎 聚水潭入库 Excel 生成")
 st.caption("上传出货单 → 核对金价 → 生成文件或同步成本")
-st.caption("版本：2026.11.06 · 流水与匹配修复")
+st.caption("版本：2026.11.06.1 · 支持xls、雅希图片")
 
 # ---------------- 飞书工具 ----------------
 def _fetch_after_update(client, key, target_cost, max_wait=4):
@@ -99,11 +99,38 @@ else:
             "添加 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET` 两行 (按 TOML 格式)。")
 
 # ---------------- 上传 + 参数 ----------------
+class ConvertedUpload:
+    """.xls 转成 .xlsx 后，让后面的流程照常使用。"""
+    def __init__(self, name, data):
+        self.name, self.size, self._data = name, len(data), data
+    def getvalue(self):
+        return self._data
+    def read(self):
+        return self._data
+
+
+def load_upload(file):
+    if file is None or not file.name.lower().endswith('.xls'):
+        return file
+    from xls_convert import xls_to_xlsx
+    cache = st.session_state.setdefault('_xls_cache', {})
+    raw = file.getvalue()
+    key = hashlib.sha256(raw).hexdigest()
+    if key not in cache:
+        cache[key] = xls_to_xlsx(raw)
+    return ConvertedUpload(file.name.rsplit('.', 1)[0] + '.xlsx', cache[key])
+
+
 uploaded = st.file_uploader(
-    "选择工厂出货单 (.xlsx)",
-    type=['xlsx'],
+    "选择工厂出货单 (.xlsx / .xls)",
+    type=['xlsx', 'xls'],
     help="支持: 雅希(广州) / 倾诚(二厂) / 黛宝(三厂) / 猛哥(四厂) / 布心(天然钻)"
 )
+try:
+    uploaded = load_upload(uploaded)
+except Exception as exc:
+    st.error(f"无法读取这份 .xls：{exc}。请用 Excel/WPS 另存为 .xlsx 后再上传。")
+    st.stop()
 
 archive_repeat_key = None
 # 文件历史与成本成功状态分开；记录失败不当成首次上传。
@@ -288,6 +315,12 @@ def archive_completed(data, source_path, items, factory, filename, flow):
         title = append_archive(archive_client, rows, factory)
         finish('written')
         st.caption(f"已追加到工厂流水 · {title}")
+        if rows.images:
+            done = len(rows.images) - rows.image_failed
+            if rows.image_failed:
+                st.warning(f"图片写入 {done}/{len(rows.images)} 张，其余请手动贴到流水；数字和文字不受影响。")
+            else:
+                st.caption(f"图片已写入 {done} 张。")
         if getattr(rows, "format_fallback", False):
             st.caption("部分格式飞书不支持，已保留全部数值和其他格式。")
     except Exception as exc:
@@ -314,7 +347,7 @@ with st.expander("仅修复归档格式"):
             st.success("原位置格式已修复，未追加流水、未写入成本。")
         except Exception as exc:
             st.error(str(exc))
-    repair_source = st.file_uploader("原出货单（完成文件含公式时用于读取原计算结果）", type=["xlsx"], key="archive_repair_source")
+    repair_source = st.file_uploader("原出货单（完成文件含公式时用于读取原计算结果）", type=["xlsx", "xls"], key="archive_repair_source")
     repair_file = st.file_uploader("工厂单完成文件", type=["xlsx"], key="archive_repair_file")
     repair_factory = st.selectbox("归档工厂", ["A", "B", "D", "E", "BUXIN"],
         format_func=lambda v: {"A":"广州", "B":"二厂", "D":"黛宝", "E":"猛哥", "BUXIN":"布心"}[v], key="archive_repair_factory")
@@ -335,6 +368,7 @@ with st.expander("仅修复归档格式"):
             from factory_archive import TOKEN, snapshot, repair_layout
             from finished_products import FinishedProductsClient
             raw = repair_file.getvalue()
+            repair_source = load_upload(repair_source)
             # Completed files with missing formula caches must be recalculated first;
             # never guess values or mutate a non-matching region.
             repair_rows = snapshot(raw, RepairBytesIO(repair_source.getvalue() if repair_source else raw), [{"_sheet": n} for n in repair_sheets],
@@ -1290,7 +1324,7 @@ with st.expander("ℹ️ 使用说明"):
 - 主石 → 主石重量 / 颜色 / 净度
 - 裸钻成本 / 配石成本 → 成本1
 
-**.xls 文件**: Streamlit Cloud 上没装 libreoffice, 请先另存为 .xlsx
+**.xls 文件**: 可直接上传，网站会自动转换
 
 **✏️ 同步飞书镶嵌成本** (v12):
 - 默认**不勾**, 只读飞书不写
