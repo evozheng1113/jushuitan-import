@@ -26,7 +26,7 @@ st.set_page_config(page_title="聚水潭入库生成", page_icon="💎", layout=
 
 st.title("💎 聚水潭入库 Excel 生成")
 st.caption("上传出货单 → 核对金价 → 生成文件或同步成本")
-st.caption("版本：2026.11.05.2 · 流水防重复写入")
+st.caption("版本：2026.11.06 · 流水与匹配修复")
 
 # ---------------- 飞书工具 ----------------
 def _fetch_after_update(client, key, target_cost, max_wait=4):
@@ -289,7 +289,7 @@ def archive_completed(data, source_path, items, factory, filename, flow):
         finish('written')
         st.caption(f"已追加到工厂流水 · {title}")
         if getattr(rows, "format_fallback", False):
-            st.caption("部分数字格式飞书不支持，已保留原数值及其他格式。")
+            st.caption("部分格式飞书不支持，已保留全部数值和其他格式。")
     except Exception as exc:
         if registry is not None and info.get('archives', {}).get(name) == 'started':
             finish('layout_incomplete' if isinstance(exc, LayoutIncomplete)
@@ -323,9 +323,10 @@ with st.expander("仅修复归档格式"):
     if repair_file is not None:
         try:
             import openpyxl as repair_xl
+            from factory_archive import default_repair_sheets
             from io import BytesIO as RepairBytesIO
             repair_book = repair_xl.load_workbook(RepairBytesIO(repair_file.getvalue()), read_only=True)
-            repair_sheets = st.multiselect("本次归档的sheet（保持原顺序）", repair_book.sheetnames, default=repair_book.sheetnames)
+            repair_sheets = st.multiselect("本次归档的sheet（保持原顺序）", repair_book.sheetnames, default=default_repair_sheets(repair_book.sheetnames, repair_factory))
             repair_book.close()
         except Exception as exc:
             st.error(f"无法读取完成文件：{exc}")
@@ -343,7 +344,7 @@ with st.expander("仅修复归档格式"):
             title = repair_layout(target, repair_rows, repair_factory, int(repair_start))
             st.success(f"已修复{title}原位置格式，未追加流水、未写入成本。")
             if getattr(repair_rows, "format_fallback", False):
-                st.caption("部分数字格式飞书不支持，已保留原数值及其他格式。")
+                st.caption("部分格式飞书不支持，已保留全部数值和其他格式。")
         except Exception as exc:
             st.error(str(exc))
 

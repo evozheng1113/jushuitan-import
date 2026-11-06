@@ -6,7 +6,9 @@ import hashlib
 import math
 import json
 import re
+import time
 import openpyxl
+from openpyxl.utils.datetime import to_excel
 import requests
 
 TOKEN = "VWlWsPmI9h5YMgtmHlNcHdgHnFh"
@@ -16,8 +18,22 @@ ALIASES = {"雅希": {"雅希", "广州", "广州厂", "雅希工厂"},
            "二厂": {"二厂", "二厂工厂", "倾城", "倾诚"},
            "黛宝": {"黛宝", "黛宝工厂"}, "猛哥": {"猛哥", "猛哥工厂"},
            "布心": {"布心", "布心工厂"}}
+# 内容中断这么多行以后的零散单元格（工厂误输入）不算本批。
+STRAY_GAP = 20
 # 这两家一个文件有很多sheet，最后一个才是新出货；其余是历史，不能再次归档。
 LATEST_SHEET_ONLY = {"二厂", "猛哥"}
+
+
+def date_text(value, fmt):
+    """日期按工厂单显示的样子写入流水；单号 11-2-3 被 Excel 变成日期时也能还原。"""
+    pattern = (fmt or "").replace("\\", "").lower()
+    if pattern == "mm-dd-yy":  # Excel 内置短日期
+        return f"{value.year}/{value.month}/{value.day}"
+    if not re.fullmatch(r"(yyyy|yy|m{1,2}|d{1,2})([-/.年月日]+(yyyy|yy|m{1,2}|d{1,2}))*[年月日]?", pattern):
+        return value.isoformat(sep=" ") if isinstance(value, datetime) else value.isoformat()
+    parts = {"yyyy": str(value.year), "yy": f"{value.year % 100:02d}", "mm": f"{value.month:02d}",
+             "m": str(value.month), "dd": f"{value.day:02d}", "d": str(value.day)}
+    return re.sub(r"yyyy|yy|mm|m|dd|d", lambda m: parts[m[0]], pattern)
 
 
 def scalar(value, percent=False):
@@ -29,6 +45,8 @@ def scalar(value, percent=False):
         raise ValueError("完成文件包含无效数字")
     if percent and isinstance(value, (int, float)):
         return f"{value * 100:.2f}%"
+    if not isinstance(value, (str, int, float, bool)):
+        return str(value)  # 时间等类型转成文字，避免整批写入失败
     # 原表公式只复制计算结果；文本不得变成目标表里的公式。
     if isinstance(value, str) and value.startswith("="):
         return "'" + value
@@ -44,6 +62,7 @@ class CompletedSheetRows(list):
         self.heights = []
         self.widths = {}
         self.batch = ""  # 本批原始内容的指纹，用来判断同一批是否写过
+        self.old_dates = {}  # 旧版把日期写成完整时间，修复格式时仍要认得出
 
 
 def rgb(color):
@@ -89,10 +108,36 @@ class LayoutIncomplete(RuntimeError):
         super().__init__(f"流水已追加到{title}第{first_row}行起，格式未完成：{cause}；请使用仅修复归档格式，请勿重跑成本")
 
 
+def font_size(size):
+    """飞书只接受 9~36 的整数字号；原表更小或更大时取最接近的值。"""
+    return f"{min(36, max(9, round(size)))}pt/1.5"
+
+
+def batch_end(rows, needed=0):
+    """rows 为有实际内容的行号。工厂解析到的货品行（needed）绝不截断。"""
+    end = 0
+    for row in sorted(rows):
+        if end and row - end > STRAY_GAP and row > needed:
+            break
+        end = row
+    return max(end, needed)
+
+
+def item_last_row(group, rows):
+    """货品占用、且确实有内容的最后一行；解析器可能把后面的空行也算给最后一件。"""
+    return max([it["row"] for it in group if it.get("row") in rows]
+               + [r for it in group for r in (it.get("rows") or []) if r in rows] + [0])
+
+
+def default_repair_sheets(sheetnames, factory):
+    """修复格式时默认选中的sheet要和当初归档的范围一致。"""
+    return list(sheetnames[-1:]) if NAMES.get(factory, factory) in LATEST_SHEET_ONLY else list(sheetnames)
+
+
 def cell_style(cell):
     style = {"font": {"bold": bool(cell.font.bold), "italic": bool(cell.font.italic)}}
     if cell.font.sz:
-        style["font"]["fontSize"] = f"{cell.font.sz:g}pt/1.5"
+        style["font"]["fontSize"] = font_size(cell.font.sz)
     foreground = rgb(cell.font.color)
     background = rgb(cell.fill.fgColor) if cell.fill.patternType == "solid" else None
     if foreground:
@@ -126,6 +171,8 @@ def snapshot(data, source_path, items, factory, filename, flow):
             sn = item.get("_sheet") or item.get("_sheet_title")
             if NAMES.get(factory, factory) in LATEST_SHEET_ONLY:
                 sn = wb.sheetnames[-1]
+            elif not sn and NAMES.get(factory, factory) == "黛宝":
+                sn = wb.active.title  # 与黛宝解析器一致
             elif not sn:
                 sn = wb.sheetnames[-1] if "row" in item else wb.sheetnames[0]
             if sn not in wb.sheetnames:
@@ -135,10 +182,12 @@ def snapshot(data, source_path, items, factory, filename, flow):
         batch = hashlib.sha256()
         for sn, group in grouped.items():
             ws, fs = wb[sn], formulas[sn]
-            populated = [(r, c) for (r, c), cell in fs._cells.items() if cell.value is not None]
+            populated = [(r, c) for (r, c), cell in fs._cells.items()
+                         if cell.value is not None and str(cell.value).strip()]
             if not populated:
                 continue
-            start, end = 1, max(r for r, c in populated)
+            content_rows = {r for r, c in populated}
+            start, end = 1, batch_end(content_rows, item_last_row(group, content_rows))
             if NAMES.get(factory, factory) == "布心":
                 # 与布心解析器一致，最后一个“客户”表头至最后一个“合计”为本次批次。
                 totals = [r for r, c in populated if c == 2 and "合计" in str(fs.cell(r, c).value)]
@@ -183,7 +232,13 @@ def snapshot(data, source_path, items, factory, filename, flow):
                             value = original[sn].cell(r, c).value
                         if value is None:
                             raise ValueError(f"{sn}!{formula.coordinate}公式没有计算结果，无法原样归档；请先用Excel重算保存")
-                    values.append(scalar(value))
+                    if isinstance(value, (datetime, date)):
+                        shown = date_text(value, formula.number_format)
+                        result.old_dates[(offset+r-start, c-1)] = (
+                            scalar(value), to_excel(value))
+                        values.append(shown)
+                    else:
+                        values.append(scalar(value))
                     row_styles.append(cell_style(formula))
                 result.append(values)
                 # 将同一行相邻的相同样式压成一个范围。
@@ -215,6 +270,32 @@ def snapshot(data, source_path, items, factory, filename, flow):
     finally:
         for book in books:
             book.close()
+
+
+def rejected(exc):
+    """飞书表格接口拒绝了某项内容（90xxx）。登录、权限类错误不算，要继续报错。"""
+    return str(exc.code).startswith("90") and len(str(exc.code)) == 5
+
+
+def layout_call(method, url, **kwargs):
+    """格式请求可安全重发；飞书限速时等一下再试，不追加、不改写数据。"""
+    for attempt in range(5):
+        response = getattr(requests, method)(url, **kwargs)
+        if getattr(response, "status_code", 200) == 429 and attempt < 4:
+            time.sleep(2 * (attempt+1))
+            continue
+        try:
+            return checked(response)
+        except ArchiveAPIError as exc:
+            if str(exc.code) != "99991400" or attempt == 4:
+                raise
+            time.sleep(2 * (attempt+1))
+
+
+def same_value(got, want):
+    if isinstance(got, (int, float)) and isinstance(want, (int, float)):
+        return abs(got - want) < 1e-6
+    return str("" if got is None else got) == str("" if want is None else want)
 
 
 def checked(response):
@@ -329,23 +410,51 @@ def apply_layout(client, sid, rows, first_row):
     for group in groups.values():
         for i in range(0, len(group["ranges"]), 100):
             batches.append({"ranges": group["ranges"][i:i+100], "style": group["style"]})
+    def put_styles(data):
+        layout_call("put", base + "/styles_batch_update", headers=client._headers(json_body=True),
+                    json={"data": data}, timeout=60)
+
+    def downgrade(group):
+        # 每次只去掉一项可能被拒的样式；只设置样式，不追加、不改写业务数据。
+        style = dict(group["style"])
+        steps = [lambda s: s.pop("formatter", None),
+                 lambda s: s.get("font", {}).pop("fontSize", None),
+                 lambda s: (s.pop("foreColor", None), s.pop("backColor", None)),
+                 lambda s: (s.pop("borderType", None), s.pop("borderColor", None)),
+                 lambda s: (s.pop("hAlign", None), s.pop("vAlign", None))]
+        style["font"] = dict(style.get("font", {}))
+        for step in steps:
+            step(style)
+            try:
+                put_styles([{"ranges": group["ranges"], "style": style}])
+                return
+            except ArchiveAPIError as exc:
+                if not rejected(exc):
+                    raise
+
     for i in range(0, len(batches), 20):
         batch = batches[i:i+20]
         try:
-            checked(requests.put(base + "/styles_batch_update", headers=client._headers(json_body=True),
-                                 json={"data": batch}, timeout=60))
+            put_styles(batch)
         except ArchiveAPIError as exc:
-            if str(exc.code) != "90204" or "invalid formatter" not in str(exc).lower() or not any("formatter" in g["style"] for g in batch):
+            if not rejected(exc):
                 raise
-            # Style assignment is idempotent. Retry only the rejected styles,
-            # never append or rewrite business costs. Preserve all other style fields.
-            plain = [{"ranges": g["ranges"], "style": {k:v for k,v in g["style"].items() if k != "formatter"}} for g in batch]
-            checked(requests.put(base + "/styles_batch_update", headers=client._headers(json_body=True),
-                                 json={"data": plain}, timeout=60))
             rows.format_fallback = True
+            for group in batch:
+                try:
+                    put_styles([group])
+                except ArchiveAPIError as single:
+                    if not rejected(single):
+                        raise
+                    downgrade(group)
     for top, left, bottom, right in rows.merges:
-        checked(requests.post(base + "/merge_cells", headers=client._headers(json_body=True),
-                            json={"range": address(top,left,bottom,right), "mergeType": "MERGE_ALL"}, timeout=30))
+        try:
+            layout_call("post", base + "/merge_cells", headers=client._headers(json_body=True),
+                        json={"range": address(top,left,bottom,right), "mergeType": "MERGE_ALL"}, timeout=30)
+        except ArchiveAPIError as exc:
+            if not rejected(exc):
+                raise
+            rows.format_fallback = True
     # 行高只设置新追加部分；列宽是飞书sheet全局属性。
     for major, dimensions in (("ROWS", rows.heights), ("COLUMNS", sorted(rows.widths.items()))):
         groups = []
@@ -356,9 +465,14 @@ def apply_layout(client, sid, rows, first_row):
             else:
                 groups.append([index,index,pixels])
         for start, end, pixels in groups:
-            checked(requests.put(base + "/dimension_range", headers=client._headers(json_body=True),
-                json={"dimension": {"sheetId": sid, "majorDimension": major, "startIndex": start-1, "endIndex": end},
-                      "dimensionProperties": {"fixedSize": pixels}}, timeout=30))
+            try:
+                layout_call("put", base + "/dimension_range", headers=client._headers(json_body=True),
+                    json={"dimension": {"sheetId": sid, "majorDimension": major, "startIndex": start-1, "endIndex": end},
+                          "dimensionProperties": {"fixedSize": pixels}}, timeout=30)
+            except ArchiveAPIError as exc:
+                if not rejected(exc):
+                    raise
+                rows.format_fallback = True
 
 
 def repair_layout(client, rows, factory, first_row):
@@ -387,7 +501,8 @@ def repair_layout(client, rows, factory, first_row):
                 for c in range(left, right):
                     got = line[c-left] if c-left < len(line) else ""
                     want = expected[c]
-                    if (got if got is not None else "") != (want if want is not None else ""):
+                    legacy = getattr(rows, "old_dates", {}).get((start+r, c), ())
+                    if not same_value(got, want) and not any(same_value(got, old) for old in legacy):
                         raise ValueError(f"第{first_row+start+r}行第{c+1}列与完成文件不一致，未修改；请核对文件、sheet和起始行")
     apply_layout(client, sid, rows, first_row)
     return matches[0]["title"]
