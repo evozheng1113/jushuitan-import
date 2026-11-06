@@ -26,7 +26,7 @@ st.set_page_config(page_title="聚水潭入库生成", page_icon="💎", layout=
 
 st.title("💎 聚水潭入库 Excel 生成")
 st.caption("上传出货单 → 核对金价 → 生成文件或同步成本")
-st.caption("版本：2026.11.06.1 · 支持xls、雅希图片")
+st.caption("版本：2026.11.06.2 · 成本先写、流水最后")
 
 # ---------------- 飞书工具 ----------------
 def _fetch_after_update(client, key, target_cost, max_wait=4):
@@ -99,6 +99,11 @@ else:
             "添加 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET` 两行 (按 TOML 格式)。")
 
 # ---------------- 上传 + 参数 ----------------
+def download_button(*args, **kwargs):
+    """点下载不重跑页面，否则会打断正在写飞书的任务。"""
+    return st.download_button(*args, on_click="ignore", **kwargs)
+
+
 class ConvertedUpload:
     """.xls 转成 .xlsx 后，让后面的流程照常使用。"""
     def __init__(self, name, data):
@@ -218,6 +223,12 @@ with col_b:
         help="勾上后写入飞书「镶嵌成本」字段",
     )
 
+spots_only = st.checkbox("只补写现货到成品新单（上次被打断时用）", value=False, disabled=not feishu_ready,
+                         help="金价要和上次一样。只写现货成本，不动客户单，不写流水。")
+if spots_only:
+    sync_feishu = False
+    st.warning("只会把这份单的现货成本叠加到成品新单。确认上次现货确实没写进去再点开始。")
+
 overwrite = False
 debug_mode = False
 if sync_feishu:
@@ -269,10 +280,87 @@ def track_sheet_cost(result, total):
         st.warning("成品成本写入未获成功确认，请核对，勿当作已同步。")
 
 
+def sync_finished_spots(items):
+    try:
+        from finished_products import (FinishedProductsClient, sync_costs,
+                                        build_sync_items_from_factory_items)
+        sync_items = build_sync_items_from_factory_items(items)
+        if sync_items:
+            st.divider()
+            st.subheader(f"🔗 同步镶嵌成本到成品新单 ({len(sync_items)} 条)")
+            fp_client = FinishedProductsClient(
+                *load_credentials())
+            with st.spinner(f"正在同步成品成本…"):
+                result = sync_costs(fp_client, sync_items, overwrite=overwrite)
+            track_sheet_cost(result, len(sync_items))
+            if result['matched']:
+                remember_action({'kind': 'spot_sync', 'run_id': current_run_id, 'count': len(result['matched'])})
+            matched = result['matched']
+            unmatched = result['unmatched']
+            errors = result['errors']
+
+            from upload_registry import sheet_confirmed
+            if matched and sheet_confirmed(result):
+                h_updated = sum(1 for m in matched if m.get('new_h') is not None)
+                st.success(
+                    f"✅ 命中 {len(matched)} 条, M 列已更新"
+                    + (f", H 列 {h_updated} 条去掉「待出货」" if h_updated else "")
+                )
+                with st.expander(f"命中详情 ({len(matched)})", expanded=False):
+                    lines = []
+                    for m in matched:
+                        h_str = ''
+                        if m.get('new_h') is not None:
+                            h_str = f"  H: {m['old_h']} → {m['new_h']}"
+                        p_display = m.get('p_val') or m.get('match_key')
+                        lines.append(
+                            f"  r{m['row']:>4}  P={p_display:<18} "
+                            f"M {m['old_m']:>6} → "
+                            f"{m['new_m']:>6}  {m['name']}{h_str}"
+                        )
+                    st.code('\n'.join(lines), language=None)
+            if unmatched:
+                st.warning(f"⚠️ {len(unmatched)} 条没匹配到成品新单: "
+                           + ', '.join(unmatched[:15])
+                           + ('...' if len(unmatched) > 15 else ''))
+            if errors:
+                for e in errors:
+                    st.error(f"❌ {e}")
+    except Exception as e:
+        track_cost(max(1, len(locals().get("sync_items", []))))
+        st.error(f"❌ 同步成品新单失败: {e}")
+        with st.expander("详细错误"):
+            st.code(traceback.format_exc())
+
+
 def track_bitable_cost(result, total):
     from upload_registry import already_synced
     track_cost(total, result.get('updated', 0), already_synced(result))
 
+
+
+archive_queue = []
+
+
+def queue_archive(data, source_path, items, factory, filename, flow):
+    """流水最慢，排到所有成本写完之后。猛哥双份流程是同一张表，只写一次。"""
+    from factory_archive import NAMES
+    name = NAMES.get(factory, factory)
+    if any(NAMES.get(job[3], job[3]) == name for job in archive_queue):
+        return
+    archive_queue.append((data, source_path, items, factory, filename, flow))
+    st.info("完成单现在就可以下载。工厂流水会在页面最下方写入，写完前请勿关闭或刷新页面。")
+
+
+def finish_run():
+    """成本结果先落定，再写流水；写流水慢或被中断都不影响成本。"""
+    if cost_progress is not None:
+        remember_action(cost_progress.event(complete=True))
+    if archive_queue:
+        st.divider()
+        st.subheader("📒 写入工厂流水")
+    while archive_queue:
+        archive_completed(*archive_queue.pop(0))
 
 
 def archive_completed(data, source_path, items, factory, filename, flow):
@@ -283,6 +371,7 @@ def archive_completed(data, source_path, items, factory, filename, flow):
     registry = None
 
     rows = None
+    bar = None
 
     def note(state):
         record_action(registry, info, uploaded.name, {'kind': 'archive', 'run_id': current_run_id,
@@ -312,8 +401,14 @@ def archive_completed(data, source_path, items, factory, filename, flow):
         registry = client
         note('started')  # 先留记录再写：记录失败就不写，中途断开也能被下次发现。
         archive_client = FinishedProductsClient(app_id, app_secret, spreadsheet_token=TOKEN)
-        title = append_archive(archive_client, rows, factory)
+        bar = st.progress(0.0, "正在写入工厂流水，请勿关闭或刷新页面…")
+
+        def progress(done, total):
+            bar.progress(done / total, f"正在写入工厂流水 {done}/{total}，请勿关闭或刷新页面…")
+
+        title = append_archive(archive_client, rows, factory, progress)
         finish('written')
+        bar.empty()
         st.caption(f"已追加到工厂流水 · {title}")
         if rows.images:
             done = len(rows.images) - rows.image_failed
@@ -324,6 +419,8 @@ def archive_completed(data, source_path, items, factory, filename, flow):
         if getattr(rows, "format_fallback", False):
             st.caption("部分格式飞书不支持，已保留全部数值和其他格式。")
     except Exception as exc:
+        if bar is not None:
+            bar.empty()
         if registry is not None and info.get('archives', {}).get(name) == 'started':
             finish('layout_incomplete' if isinstance(exc, LayoutIncomplete)
                    else 'uncertain' if isinstance(exc, ArchiveUncertain) else 'failed')
@@ -372,7 +469,7 @@ with st.expander("仅修复归档格式"):
             # Completed files with missing formula caches must be recalculated first;
             # never guess values or mutate a non-matching region.
             repair_rows = snapshot(raw, RepairBytesIO(repair_source.getvalue() if repair_source else raw), [{"_sheet": n} for n in repair_sheets],
-                "完成文件", repair_file.name, "格式修复")
+                repair_factory, repair_file.name, "格式修复")
             aid, secret = load_credentials()
             target = FinishedProductsClient(aid, secret, spreadsheet_token=TOKEN)
             title = repair_layout(target, repair_rows, repair_factory, int(repair_start))
@@ -618,7 +715,7 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
             st.warning(f"⚠️ {red_count} 件多散货, 客户名已标红 — 请人工核验")
 
         fname = f'聚水潭_{factory_name}真诚_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
-        st.download_button(
+        download_button(
             f"📥 下载 {factory_name} 真诚聚水潭 ({len(items)} 件)",
             data=data, file_name=fname,
             mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -725,7 +822,7 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
                     try: os.unlink(profit_path)
                     except OSError: pass
                     profit_fname = f'{_dt.now().strftime("%Y%m%d")}_{factory_name}_利润简报.xlsx'
-                    st.download_button(
+                    download_button(
                         f"📊 下载利润简报 ({len(items)} 件)",
                         data=profit_data, file_name=profit_fname,
                         mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -758,7 +855,7 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
         except OSError: pass
         base = uploaded_name.rsplit('.', 1)[0]
         complete_fname = f'{datetime.now().strftime("%Y%m%d")}{base}_完成.xlsx'
-        st.download_button(
+        download_button(
             f"📥 下载工厂单完成文件 ({factory_name}, 追加4列)",
             data=complete_data, file_name=complete_fname,
             mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -766,7 +863,7 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
             key=f'dl_natcomplete_{factory_name}_{datetime.now().timestamp()}',
         )
         remember_generated()
-        archive_completed(complete_data, in_path, items, factory_name, complete_fname, "真诚")
+        queue_archive(complete_data, in_path, items, factory_name, complete_fname, "真诚")
         st.caption("完成文件在原表最右侧追加: 总镶嵌成本 | 客户名称 | 利润 | 利润率")
         st.session_state.setdefault('history', []).append({
             '时间': datetime.now().strftime('%H:%M:%S'),
@@ -835,6 +932,9 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                 f"{'查飞书' if use_feishu else '不查飞书'}")
 
         # v19: 单纯天然钻工厂 (布心 / 黛宝 / 二厂) → 只跑天然流程, 跳过培育
+        if spots_only and is_natural and code != 'E':
+            st.error("天然钻单的现货不会被流水打断，不需要补写。")
+            st.stop()
         if is_natural and code != 'E':
             natural_factory = detect_natural_factory_name(code, uploaded.name)
             if not natural_factory:
@@ -844,9 +944,10 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                 st.stop()
             run_natural_workflow(in_path, uploaded.name, natural_factory, pt, au,
                                  gia_months=GIA_MONTHS, sync_feishu=sync_feishu)
+            run_complete = True
+            finish_run()
             try: os.unlink(in_path)
             except OSError: pass
-            run_complete = True
             st.stop()
 
         default_material = detect_default_material(uploaded.name)
@@ -856,6 +957,15 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
 
         with st.spinner("解析工厂账单..."):
             items = factories.get_parser(code)(in_path, **parse_kwargs)
+
+        if spots_only:
+            done_before = st.session_state.get('_upload_checks_v3', {}).get(upload_key, {}).get('spot_sync')
+            if done_before:
+                st.warning("这份单的现货已经写过成品新单，本次没有再写。")
+            else:
+                sync_finished_spots(items)
+            run_complete = True
+            st.stop()
 
         clients = [it for it in items if it['类别'] == '客户单']
         spots = [it for it in items if it['类别'] in ('现货', '部门-真诚-现货')]
@@ -1075,7 +1185,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                 with open(out_path, 'rb') as f:
                     jst_data = f.read()
                 jst_fname = f'聚水潭入库_{code}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
-                st.download_button(
+                download_button(
                     "📥 下载聚水潭入库 Excel", data=jst_data, file_name=jst_fname,
                     mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                     type="primary",
@@ -1108,7 +1218,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
             # v15.3: 文件名格式 = 日期 + 原始文件名 (例 20260630郑总-6月份18k-培育钻(44).xlsx)
             base = uploaded.name.rsplit('.', 1)[0]
             done_fname = f'{datetime.now().strftime("%Y%m%d")}{base}.xlsx'
-            st.download_button(
+            download_button(
                 "📥 下载工厂单 _完成.xlsx",
                 data=done_data, file_name=done_fname,
                 mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -1116,7 +1226,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                 type="primary",
             )
             remember_generated()
-            archive_completed(done_data, in_path, items, code, done_fname, "常规")
+            queue_archive(done_data, in_path, items, code, done_fname, "常规")
             cap_parts = []
             if clients: cap_parts.append("客户名/利润/利润率")
             if spots: cap_parts.append("现货 AD 单价成本")
@@ -1209,54 +1319,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
         # v20 + v22.9: 同步镶嵌成本到成品新单 (飞书电子表格) M 列
         # v22.9: 绑定 "✏️同步今日成本到飞书" 复选框, 不勾就不跑 (避免重复叠加)
         if sync_feishu:
-            try:
-                from finished_products import (FinishedProductsClient, sync_costs,
-                                                build_sync_items_from_factory_items)
-                sync_items = build_sync_items_from_factory_items(items)
-                if sync_items:
-                    st.divider()
-                    st.subheader(f"🔗 同步镶嵌成本到成品新单 ({len(sync_items)} 条)")
-                    fp_client = FinishedProductsClient(
-                        _client.app_id, _client.app_secret)
-                    with st.spinner(f"正在同步成品成本…"):
-                        result = sync_costs(fp_client, sync_items, overwrite=overwrite)
-                    track_sheet_cost(result, len(sync_items))
-                    matched = result['matched']
-                    unmatched = result['unmatched']
-                    errors = result['errors']
-
-                    from upload_registry import sheet_confirmed
-                    if matched and sheet_confirmed(result):
-                        h_updated = sum(1 for m in matched if m.get('new_h') is not None)
-                        st.success(
-                            f"✅ 命中 {len(matched)} 条, M 列已更新"
-                            + (f", H 列 {h_updated} 条去掉「待出货」" if h_updated else "")
-                        )
-                        with st.expander(f"命中详情 ({len(matched)})", expanded=False):
-                            lines = []
-                            for m in matched:
-                                h_str = ''
-                                if m.get('new_h') is not None:
-                                    h_str = f"  H: {m['old_h']} → {m['new_h']}"
-                                p_display = m.get('p_val') or m.get('match_key')
-                                lines.append(
-                                    f"  r{m['row']:>4}  P={p_display:<18} "
-                                    f"M {m['old_m']:>6} → "
-                                    f"{m['new_m']:>6}  {m['name']}{h_str}"
-                                )
-                            st.code('\n'.join(lines), language=None)
-                    if unmatched:
-                        st.warning(f"⚠️ {len(unmatched)} 条没匹配到成品新单: "
-                                   + ', '.join(unmatched[:15])
-                                   + ('...' if len(unmatched) > 15 else ''))
-                    if errors:
-                        for e in errors:
-                            st.error(f"❌ {e}")
-            except Exception as e:
-                track_cost(max(1, len(locals().get("sync_items", []))))
-                st.error(f"❌ 同步成品新单失败: {e}")
-                with st.expander("详细错误"):
-                    st.code(traceback.format_exc())
+            sync_finished_spots(items)
         else:
             # v22.9: 不勾同步飞书 → 只提示不动
             sync_items_preview = None
@@ -1270,6 +1333,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
                 st.info(f"ℹ️ 有 {len(sync_items_preview)} 条现货可同步到成品新单 (勾选「✏️ 同步今日成本到飞书」后才写入)")
 
         run_complete = True
+        finish_run()
         try:
             os.unlink(in_path)
         except OSError:
@@ -1298,7 +1362,7 @@ if hist:
         with col_c:
             st.text(f"{h['件数']} 件")
         with col_d:
-            st.download_button(
+            download_button(
                 "📥 重下载",
                 data=h['_data'],
                 file_name=h['文件名'],

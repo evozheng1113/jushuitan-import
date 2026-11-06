@@ -1,4 +1,5 @@
 """将本次完成单的数据快照追加到指定飞书电子表格；不写业务成本表。"""
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from io import BytesIO
@@ -18,6 +19,8 @@ ALIASES = {"雅希": {"雅希", "广州", "广州厂", "雅希工厂"},
            "二厂": {"二厂", "二厂工厂", "倾城", "倾诚"},
            "黛宝": {"黛宝", "黛宝工厂"}, "猛哥": {"猛哥", "猛哥工厂"},
            "布心": {"布心", "布心工厂"}}
+# 飞书这些接口上限 100 次/秒。格式请求可重发，并行发更快；失败的再逐个补发。
+WORKERS = 6
 # 内容中断这么多行以后的零散单元格（工厂误输入）不算本批。
 STRAY_GAP = 20
 # 这两家一个文件有很多sheet，最后一个才是新出货；其余是历史，不能再次归档。
@@ -179,15 +182,19 @@ def sheet_images(ws, offset, start, end, width):
     return found
 
 
-def write_images(client, sid, rows, first_row):
+def write_images(client, sid, rows, first_row, tick=None):
     """图片失败只记数，数字文字已写好，这里绝不抛错。"""
-    failed = 0
-    for index, col, data, name in rows.images:
+    headers = client._headers(json_body=True)
+
+    def task(index, col, data, name):
         cell = f"{openpyxl.utils.get_column_letter(col)}{first_row+index}"
+        return lambda: layout_call("post", f"{BASE}/sheets/v2/spreadsheets/{TOKEN}/values_image", headers=headers,
+                                   json={"range": f"{sid}!{cell}:{cell}", "image": list(data), "name": name}, timeout=60)
+
+    failed = 0
+    for retry in run_parallel([task(*image) for image in rows.images], tick):
         try:
-            layout_call("post", f"{BASE}/sheets/v2/spreadsheets/{TOKEN}/values_image",
-                        headers=client._headers(json_body=True),
-                        json={"range": f"{sid}!{cell}:{cell}", "image": list(data), "name": name}, timeout=60)
+            retry()
         except (ArchiveAPIError, requests.exceptions.RequestException, ValueError):
             failed += 1
     rows.image_failed = failed
@@ -329,6 +336,21 @@ def layout_call(method, url, **kwargs):
             time.sleep(2 * (attempt+1))
 
 
+def run_parallel(tasks, tick=None):
+    """tasks 里每项可安全重发。返回并行失败、需要逐个补发的任务。"""
+    failed = []
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        futures = {pool.submit(task): task for task in tasks}
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception:
+                failed.append(futures[future])
+            if tick:
+                tick()  # 在主线程更新进度，页面组件不能从子线程调用
+    return failed
+
+
 def same_value(got, want):
     if isinstance(got, (list, dict)) and want in ("", None):
         return True  # 空格子里读到对象，是写进去的图片
@@ -345,7 +367,7 @@ def checked(response):
     return payload.get("data") or {}
 
 
-def append_archive(client, rows, factory):
+def append_archive(client, rows, factory, progress=None):
     if client.spreadsheet_token != TOKEN:
         raise ValueError("归档目标表不正确")
     factory = NAMES.get(factory, factory)
@@ -422,6 +444,7 @@ def append_archive(client, rows, factory):
             raise ArchiveUncertain("流水数据已提交，但返回位置无法确认，未继续设置格式；请勿重跑成本")
         first_row = int(match[1])
         layout_error = None
+        tick = progress_ticker(rows, progress)
         try:
             # 宽表分列写入同一批已追加区域，绝不压缩原来的列位置。
             for left in range(100, width, 100):
@@ -430,16 +453,28 @@ def append_archive(client, rows, factory):
                 checked(requests.put(f"{BASE}/sheets/v2/spreadsheets/{TOKEN}/values",
                     headers=client._headers(json_body=True),
                     json={"valueRange": {"range": target, "values": [r[left:right] for r in rows]}}, timeout=60))
-            apply_layout(client, sid, rows, first_row)
+            apply_layout(client, sid, rows, first_row, tick)
         except Exception as exc:
             layout_error = exc
-        write_images(client, sid, rows, first_row)
+        write_images(client, sid, rows, first_row, tick)
         if layout_error is not None:
             raise LayoutIncomplete(sheet["title"], sid, first_row, rows, layout_error) from layout_error
     return sheet["title"]
 
 
-def apply_layout(client, sid, rows, first_row):
+def progress_ticker(rows, progress):
+    if not progress:
+        return None
+    total = len(rows.merges) + len(rows.images) + len(rows.heights) + len(rows.widths) + 1
+    done = [0]
+
+    def tick():
+        done[0] += 1
+        progress(min(done[0], total), total)
+    return tick
+
+
+def apply_layout(client, sid, rows, first_row, tick=None):
     def address(top, left, bottom, right):
         return f"{sid}!{openpyxl.utils.get_column_letter(left)}{first_row+top-1}:{openpyxl.utils.get_column_letter(right)}{first_row+bottom-1}"
     base = f"{BASE}/sheets/v2/spreadsheets/{TOKEN}"
@@ -490,15 +525,31 @@ def apply_layout(client, sid, rows, first_row):
                     if not rejected(single):
                         raise
                     downgrade(group)
-    for top, left, bottom, right in rows.merges:
-        try:
-            layout_call("post", base + "/merge_cells", headers=client._headers(json_body=True),
-                        json={"range": address(top,left,bottom,right), "mergeType": "MERGE_ALL"}, timeout=30)
-        except ArchiveAPIError as exc:
-            if not rejected(exc):
-                raise
-            rows.format_fallback = True
+    headers = client._headers(json_body=True)
+
+    def finish(tasks):
+        # 并行失败的逐个补发；飞书明确拒绝的跳过，登录权限问题继续报错。
+        for retry in run_parallel(tasks, tick):
+            try:
+                retry()
+            except ArchiveAPIError as exc:
+                if not rejected(exc):
+                    raise
+                rows.format_fallback = True
+
+    def merge(top, left, bottom, right):
+        return lambda: layout_call("post", base + "/merge_cells", headers=headers, timeout=30,
+                                   json={"range": address(top, left, bottom, right), "mergeType": "MERGE_ALL"})
+
+    def resize(major, start, end, pixels):
+        return lambda: layout_call("put", base + "/dimension_range", headers=headers, timeout=30,
+                                   json={"dimension": {"sheetId": sid, "majorDimension": major,
+                                                       "startIndex": start-1, "endIndex": end},
+                                         "dimensionProperties": {"fixedSize": pixels}})
+
+    finish([merge(*item) for item in rows.merges])
     # 行高只设置新追加部分；列宽是飞书sheet全局属性。
+    tasks = []
     for major, dimensions in (("ROWS", rows.heights), ("COLUMNS", sorted(rows.widths.items()))):
         groups = []
         for index, pixels in dimensions:
@@ -506,16 +557,9 @@ def apply_layout(client, sid, rows, first_row):
             if groups and groups[-1][1] == index-1 and groups[-1][2] == pixels:
                 groups[-1][1] = index
             else:
-                groups.append([index,index,pixels])
-        for start, end, pixels in groups:
-            try:
-                layout_call("put", base + "/dimension_range", headers=client._headers(json_body=True),
-                    json={"dimension": {"sheetId": sid, "majorDimension": major, "startIndex": start-1, "endIndex": end},
-                          "dimensionProperties": {"fixedSize": pixels}}, timeout=30)
-            except ArchiveAPIError as exc:
-                if not rejected(exc):
-                    raise
-                rows.format_fallback = True
+                groups.append([index, index, pixels])
+        tasks += [resize(major, start, end, pixels) for start, end, pixels in groups]
+    finish(tasks)
 
 
 def repair_layout(client, rows, factory, first_row):
@@ -548,4 +592,5 @@ def repair_layout(client, rows, factory, first_row):
                     if not same_value(got, want) and not any(same_value(got, old) for old in legacy):
                         raise ValueError(f"第{first_row+start+r}行第{c+1}列与完成文件不一致，未修改；请核对文件、sheet和起始行")
     apply_layout(client, sid, rows, first_row)
+    write_images(client, sid, rows, first_row)  # 中断过的批次在这里补图，同格重写不会重复
     return matches[0]["title"]

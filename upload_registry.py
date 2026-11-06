@@ -160,6 +160,8 @@ def action_summary(matches):
             summary['cost_action'] = event
         if event.get('kind') == 'archive' and event.get('factory'):
             summary['archives'][event['factory']] = event.get('state')
+        if event.get('kind') == 'spot_sync':
+            summary['spot_sync'] = True
     return summary
 
 
@@ -237,6 +239,8 @@ def record_action(client, info, filename, event):
             info['jst_scopes'].append(scope)
     elif event['kind'] == 'cost_sync':
         info['cost_action'] = dict(event)
+    elif event['kind'] == 'spot_sync':
+        info['spot_sync'] = True
     elif event['kind'] == 'archive':
         info.setdefault('archives', {})[event['factory']] = event['state']
         info['archive_count'] = info.get('archive_count', 0) + 1
