@@ -68,6 +68,7 @@ class CompletedSheetRows(list):
         self.widths = {}
         self.batch = ""  # 本批原始内容的指纹，用来判断同一批是否写过
         self.images = []  # (本批内0起的行, 列号, 图片内容, 文件名)
+        self.blocks = []  # (sheet名, 起始行, 结束行, 列数, 合并范围, 在本批中的起始位置)
         self.image_failed = 0
         self.old_dates = {}  # 旧版把日期写成完整时间，修复格式时仍要认得出
 
@@ -180,6 +181,57 @@ def sheet_images(ws, offset, start, end, width):
         used.add((row, col))
         found.append((offset+row-start, col, image._data(), f"{row}_{col}.{image.format or 'png'}"))
     return found
+
+
+def batch_workbook(data, source_path, rows, factory):
+    """把本批（与 snapshot 同一范围）单独存成一个 xlsx，原样保留格式、合并、行高列宽和图片，用于导入飞书。
+    数值取 snapshot 已算好的结果，公式不再依赖其他 sheet。"""
+    from copy import copy
+    from openpyxl.drawing.image import Image as XLImage
+    styles = openpyxl.load_workbook(BytesIO(data))
+    try:
+        source = openpyxl.load_workbook(source_path) if NAMES.get(factory, factory) in IMAGE_FACTORIES else None
+    except Exception:
+        source = None
+    out = openpyxl.Workbook()
+    out.remove(out.active)
+    for sn, start, end, width, merges, offset in rows.blocks:
+        fs = styles[sn]
+        ws = out.create_sheet(sn[:31])
+        for r in range(start, end + 1):
+            values = rows[offset + r - start]
+            for c in range(1, width + 1):
+                src = fs.cell(r, c)
+                value = values[c-1] if c-1 < len(values) else ""
+                cell = ws.cell(r - start + 1, c, None if value == "" else value)
+                if src.has_style:
+                    cell.font, cell.fill, cell.border = copy(src.font), copy(src.fill), copy(src.border)
+                    cell.alignment, cell.number_format = copy(src.alignment), src.number_format
+                    if isinstance(value, str) and src.number_format not in ("General", "@"):
+                        cell.number_format = "@"  # 已按原样显示成文字的日期等，不再套数字格式
+            height = fs.row_dimensions[r].height
+            if height:
+                ws.row_dimensions[r - start + 1].height = height
+        for top, left, bottom, right in merges:
+            ws.merge_cells(start_row=top - start + 1, start_column=left, end_row=bottom - start + 1, end_column=right)
+        for c in range(1, width + 1):
+            letter = openpyxl.utils.get_column_letter(c)
+            dim = next((d for d in fs.column_dimensions.values() if (d.min or 0) <= c <= (d.max or 0)), None)
+            if dim is not None and dim.width:
+                ws.column_dimensions[letter].width = dim.width
+        if source is not None and sn in source.sheetnames:
+            for image in source[sn]._images:
+                anchor = getattr(image.anchor, "_from", None)
+                if anchor is None or not start <= anchor.row + 1 <= end or anchor.col + 1 > width:
+                    continue
+                picture = XLImage(BytesIO(image._data()))
+                picture.width, picture.height = image.width, image.height
+                ws.add_image(picture, f"{openpyxl.utils.get_column_letter(anchor.col + 1)}{anchor.row + 1 - start + 1}")
+    if not out.sheetnames:
+        raise ValueError("本次没有可归档的完成单")
+    buffer = BytesIO()
+    out.save(buffer)
+    return buffer.getvalue()
 
 
 def write_images(client, sid, rows, first_row, tick=None):
@@ -296,6 +348,8 @@ def snapshot(data, source_path, items, factory, filename, flow):
             for merged in merges:
                 result.merges.append((offset+merged.min_row-start+1, merged.min_col,
                                       offset+merged.max_row-start+1, merged.max_col))
+            result.blocks.append((sn, start, end, width,
+                                  [(m.min_row, m.min_col, m.max_row, m.max_col) for m in merges], offset))
             for c in range(1, width+1):
                 # 同工厂同一sheet的列宽为共享属性，记录完成单使用的宽度。
                 dim = next((d for d in fs.column_dimensions.values() if (d.min or 0) <= c <= (d.max or 0)), None)
