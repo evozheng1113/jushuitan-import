@@ -26,7 +26,7 @@ st.set_page_config(page_title="聚水潭入库生成", page_icon="💎", layout=
 
 st.title("💎 聚水潭入库 Excel 生成")
 st.caption("上传出货单 → 核对金价 → 生成文件或同步成本")
-st.caption("版本：2026.11.10 · 流水改为原样导入")
+st.caption("版本：2026.11.11 · 流水写回一份表")
 
 # ---------------- 飞书工具 ----------------
 def _fetch_after_update(client, key, target_cost, max_wait=4):
@@ -386,11 +386,9 @@ def archive_completed(data, source_path, items, factory, filename, flow):
             st.warning("流水结果记录保存失败，再次处理这个文件前请先查看工厂流水。")
 
     try:
-        from factory_archive import snapshot, batch_workbook
-        from flow_import import import_batch
+        from factory_archive import TOKEN, snapshot, append_archive
         from finished_products import FinishedProductsClient
         rows = snapshot(data, source_path, items, factory, filename, flow)
-        book = batch_workbook(data, source_path, rows, factory)  # 先在本机做好，出错不会留下半条记录
         app_id, app_secret = load_credentials()
         client = FinishedProductsClient(app_id, app_secret)
         previous = archive_state(client, name, rows.batch)
@@ -402,17 +400,25 @@ def archive_completed(data, source_path, items, factory, filename, flow):
             return
         registry = client
         note('started')  # 先留记录再写：记录失败就不写，中途断开也能被下次发现。
+        archive_client = FinishedProductsClient(app_id, app_secret, spreadsheet_token=TOKEN)
         bar = st.progress(0.0, "正在写入工厂流水，请勿关闭或刷新页面…")
 
         def progress(done, total):
             bar.progress(done / total, f"正在写入工厂流水 {done}/{total}，请勿关闭或刷新页面…")
 
-        url, notes = import_batch(client, book, name, uploaded.name, len(items), rows.batch, progress)
+        title = append_archive(archive_client, rows, factory, progress)
         finish('written')
         bar.empty()
-        st.success(f"已导入工厂流水 · {name}　[打开这批流水]({url})")
-        for message in notes:
-            st.warning(message)
+        end_row = rows.first_row + len(rows) - 1
+        st.success(f"已写入工厂流水 · {title} 第 {rows.first_row}–{end_row} 行")
+        if rows.images:
+            done = len(rows.images) - rows.image_failed
+            if rows.image_failed:
+                st.warning(f"图片写入 {done}/{len(rows.images)} 张，其余请手动贴到流水；数字和文字不受影响。")
+            else:
+                st.caption(f"图片已放进格子 {done} 张。")
+        if getattr(rows, "format_fallback", False):
+            st.caption("部分格式飞书不支持，已保留全部数值和其他格式。")
     except Exception as exc:
         if bar is not None:
             bar.empty()

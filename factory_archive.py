@@ -20,7 +20,19 @@ ALIASES = {"雅希": {"雅希", "广州", "广州厂", "雅希工厂"},
            "黛宝": {"黛宝", "黛宝工厂"}, "猛哥": {"猛哥", "猛哥工厂"},
            "布心": {"布心", "布心工厂"}}
 # 飞书这些接口上限 100 次/秒。格式请求可重发，并行发更快；失败的再逐个补发。
-WORKERS = 6
+WORKERS = 16
+GAP_ROWS = 2  # 每批之间空两行，和手工贴的 2026 工厂单一样
+_SESSION = requests.Session()
+
+
+class _Http:
+    """复用连接（服务器在海外，每次重新握手很慢）。测试替换 requests.get/post/put 时仍走替换后的函数。"""
+    def __getattr__(self, name):
+        fn = getattr(requests, name)
+        return getattr(_SESSION, name) if getattr(fn, "__module__", "").startswith("requests") else fn
+
+
+HTTP = _Http()
 # 内容中断这么多行以后的零散单元格（工厂误输入）不算本批。
 STRAY_GAP = 20
 # 这两家一个文件有很多sheet，最后一个才是新出货；其余是历史，不能再次归档。
@@ -183,57 +195,6 @@ def sheet_images(ws, offset, start, end, width):
     return found
 
 
-def batch_workbook(data, source_path, rows, factory):
-    """把本批（与 snapshot 同一范围）单独存成一个 xlsx，原样保留格式、合并、行高列宽和图片，用于导入飞书。
-    数值取 snapshot 已算好的结果，公式不再依赖其他 sheet。"""
-    from copy import copy
-    from openpyxl.drawing.image import Image as XLImage
-    styles = openpyxl.load_workbook(BytesIO(data))
-    try:
-        source = openpyxl.load_workbook(source_path) if NAMES.get(factory, factory) in IMAGE_FACTORIES else None
-    except Exception:
-        source = None
-    out = openpyxl.Workbook()
-    out.remove(out.active)
-    for sn, start, end, width, merges, offset in rows.blocks:
-        fs = styles[sn]
-        ws = out.create_sheet(sn[:31])
-        for r in range(start, end + 1):
-            values = rows[offset + r - start]
-            for c in range(1, width + 1):
-                src = fs.cell(r, c)
-                value = values[c-1] if c-1 < len(values) else ""
-                cell = ws.cell(r - start + 1, c, None if value == "" else value)
-                if src.has_style:
-                    cell.font, cell.fill, cell.border = copy(src.font), copy(src.fill), copy(src.border)
-                    cell.alignment, cell.number_format = copy(src.alignment), src.number_format
-                    if isinstance(value, str) and src.number_format not in ("General", "@"):
-                        cell.number_format = "@"  # 已按原样显示成文字的日期等，不再套数字格式
-            height = fs.row_dimensions[r].height
-            if height:
-                ws.row_dimensions[r - start + 1].height = height
-        for top, left, bottom, right in merges:
-            ws.merge_cells(start_row=top - start + 1, start_column=left, end_row=bottom - start + 1, end_column=right)
-        for c in range(1, width + 1):
-            letter = openpyxl.utils.get_column_letter(c)
-            dim = next((d for d in fs.column_dimensions.values() if (d.min or 0) <= c <= (d.max or 0)), None)
-            if dim is not None and dim.width:
-                ws.column_dimensions[letter].width = dim.width
-        if source is not None and sn in source.sheetnames:
-            for image in source[sn]._images:
-                anchor = getattr(image.anchor, "_from", None)
-                if anchor is None or not start <= anchor.row + 1 <= end or anchor.col + 1 > width:
-                    continue
-                picture = XLImage(BytesIO(image._data()))
-                picture.width, picture.height = image.width, image.height
-                ws.add_image(picture, f"{openpyxl.utils.get_column_letter(anchor.col + 1)}{anchor.row + 1 - start + 1}")
-    if not out.sheetnames:
-        raise ValueError("本次没有可归档的完成单")
-    buffer = BytesIO()
-    out.save(buffer)
-    return buffer.getvalue()
-
-
 def write_images(client, sid, rows, first_row, tick=None):
     """图片失败只记数，数字文字已写好，这里绝不抛错。"""
     headers = client._headers(json_body=True)
@@ -378,7 +339,7 @@ def rejected(exc):
 def layout_call(method, url, **kwargs):
     """格式请求可安全重发；飞书限速时等一下再试，不追加、不改写数据。"""
     for attempt in range(5):
-        response = getattr(requests, method)(url, **kwargs)
+        response = getattr(HTTP, method)(url, **kwargs)
         if getattr(response, "status_code", 200) == 429 and attempt < 4:
             time.sleep(2 * (attempt+1))
             continue
@@ -425,7 +386,7 @@ def append_archive(client, rows, factory, progress=None):
     if client.spreadsheet_token != TOKEN:
         raise ValueError("归档目标表不正确")
     factory = NAMES.get(factory, factory)
-    listing = checked(requests.get(f"{BASE}/sheets/v3/spreadsheets/{TOKEN}/sheets/query",
+    listing = checked(HTTP.get(f"{BASE}/sheets/v3/spreadsheets/{TOKEN}/sheets/query",
                                   headers=client._headers(), timeout=30))
     sheets = listing.get("sheets", [])
     accepted = ALIASES.get(factory, {factory})
@@ -445,7 +406,7 @@ def append_archive(client, rows, factory, progress=None):
         extra = width - current_columns
         problem = None
         try:
-            expansion = checked(requests.post(
+            expansion = checked(HTTP.post(
                 f"{BASE}/sheets/v2/spreadsheets/{TOKEN}/dimension_range",
                 headers=client._headers(json_body=True),
                 json={"dimension": {"sheetId": sid, "majorDimension": "COLUMNS", "length": extra}},
@@ -467,7 +428,7 @@ def append_archive(client, rows, factory, progress=None):
         if problem:
             # 补列的请求可能已经生效。仅重新读取，不重发补列或流水写入。
             try:
-                latest = checked(requests.get(
+                latest = checked(HTTP.get(
                     f"{BASE}/sheets/v3/spreadsheets/{TOKEN}/sheets/query",
                     headers=client._headers(), timeout=30))
                 found = next((s for s in latest.get("sheets", []) if s.get("sheet_id") == sid), None)
@@ -478,35 +439,45 @@ def append_archive(client, rows, factory, progress=None):
             if not isinstance(actual, int) or actual < width:
                 raise RuntimeError(f"{problem}；{sheet['title']}目前{actual}列，需要{width}列，本次尚未追加流水")
             grid = latest_grid
-    last = max(int(grid.get("row_count", 1)), 1)
-    col = openpyxl.utils.get_column_letter(min(width, 100))
-    # 整个已分配范围搜索末尾，避免只搜索首行覆盖旧流水。单次请求，不自动重试写入。
+    total_rows = max(int(grid.get("row_count", 1)), 1)
+    columns = max(int(grid.get("column_count") or width), width)
+    used = last_used_row(client, sid, total_rows, columns)
+    first_row = used + GAP_ROWS + 1 if used else 1
+    need = first_row + len(rows) - 1
+    while total_rows < need:
+        # 只在表格底部加空行，不动已有数据；这一步失败说明还没写任何流水。
+        add = min(need - total_rows, 5000)
+        checked(HTTP.post(f"{BASE}/sheets/v2/spreadsheets/{TOKEN}/dimension_range",
+                          headers=client._headers(json_body=True),
+                          json={"dimension": {"sheetId": sid, "majorDimension": "ROWS", "length": add}}, timeout=30))
+        total_rows += add
+    # 写到指定行，不用飞书“找第一个空格”的追加方式（会插进旧数据中间）。每次不超过 5000 行、100 列。
+    wrote = False
     try:
-        result = checked(requests.post(
-            f"{BASE}/sheets/v2/spreadsheets/{TOKEN}/values_append?insertDataOption=INSERT_ROWS",
-            headers=client._headers(json_body=True),
-            json={"valueRange": {"range": f"{sid}!A1:{col}{last}", "values": [row[:100] for row in rows]}}, timeout=60))
+        for top in range(0, len(rows), 5000):
+            block = rows[top:top + 5000]
+            for left in range(0, width, 100):
+                right = min(left + 100, width)
+                target = (f"{sid}!{openpyxl.utils.get_column_letter(left + 1)}{first_row + top}:"
+                          f"{openpyxl.utils.get_column_letter(right)}{first_row + top + len(block) - 1}")
+                checked(HTTP.put(f"{BASE}/sheets/v2/spreadsheets/{TOKEN}/values",
+                                 headers=client._headers(json_body=True),
+                                 json={"valueRange": {"range": target, "values": [r[left:right] for r in block]}},
+                                 timeout=60))
+                wrote = True
     except requests.exceptions.RequestException as exc:
-        raise ArchiveUncertain("归档请求未获得确认，可能已写入；请先查看工厂流水再决定是否重跑") from exc
-    updates = result.get("updates") or {}
-    if updates.get("updatedRows") != len(rows):
-        raise ArchiveUncertain("飞书未确认完整归档，请检查工厂流水；勿直接重跑")
+        raise ArchiveUncertain("写流水的请求没有收到确认，可能已写入；请先查看工厂流水再决定是否重跑") from exc
+    except ArchiveAPIError as exc:
+        if wrote:
+            raise ArchiveUncertain(f"流水只写入了一部分（{exc}）；请先查看工厂流水") from exc
+        raise
+    rows.first_row = first_row
+    if used:
+        rows.widths = {}  # 列宽对整张表生效，表里已有内容时沿用原列宽
     if isinstance(rows, CompletedSheetRows):
-        written_range = updates.get("updatedRange", "")
-        match = re.fullmatch(re.escape(sid) + r"!A(\d+):[A-Z]+(\d+)", written_range)
-        if not match or int(match[2])-int(match[1])+1 != len(rows):
-            raise ArchiveUncertain("流水数据已提交，但返回位置无法确认，未继续设置格式；请勿重跑成本")
-        first_row = int(match[1])
         layout_error = None
         tick = progress_ticker(rows, progress)
         try:
-            # 宽表分列写入同一批已追加区域，绝不压缩原来的列位置。
-            for left in range(100, width, 100):
-                right = min(left+100, width)
-                target = f"{sid}!{openpyxl.utils.get_column_letter(left+1)}{first_row}:{openpyxl.utils.get_column_letter(right)}{first_row+len(rows)-1}"
-                checked(requests.put(f"{BASE}/sheets/v2/spreadsheets/{TOKEN}/values",
-                    headers=client._headers(json_body=True),
-                    json={"valueRange": {"range": target, "values": [r[left:right] for r in rows]}}, timeout=60))
             apply_layout(client, sid, rows, first_row, tick)
         except Exception as exc:
             layout_error = exc
@@ -514,6 +485,23 @@ def append_archive(client, rows, factory, progress=None):
         if layout_error is not None:
             raise LayoutIncomplete(sheet["title"], sid, first_row, rows, layout_error) from layout_error
     return sheet["title"]
+
+
+def last_used_row(client, sid, total_rows, columns):
+    """从表格底部往上读，找到真正有内容的最后一行（任何一列有值都算，包括图片）。"""
+    right = openpyxl.utils.get_column_letter(min(max(columns, 1), 200))
+    end = total_rows
+    while end >= 1:
+        start = max(1, end - 1999)
+        data = checked(HTTP.get(f"{BASE}/sheets/v2/spreadsheets/{TOKEN}/values/{sid}!A{start}:{right}{end}",
+                                headers=client._headers(), params={"valueRenderOption": "UnformattedValue"},
+                                timeout=60))
+        values = (data.get("valueRange") or {}).get("values") or []
+        for offset in range(len(values) - 1, -1, -1):
+            if any(v not in (None, "") for v in (values[offset] or [])):
+                return start + offset
+        end = start - 1
+    return 0
 
 
 def progress_ticker(rows, progress):
