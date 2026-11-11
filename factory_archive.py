@@ -472,6 +472,7 @@ def append_archive(client, rows, factory, progress=None):
             raise ArchiveUncertain(f"流水只写入了一部分（{exc}）；请先查看工厂流水") from exc
         raise
     rows.first_row = first_row
+    rows.sheet_id = sid
     if used:
         rows.widths = {}  # 列宽对整张表生效，表里已有内容时沿用原列宽
     if isinstance(rows, CompletedSheetRows):
@@ -488,9 +489,11 @@ def append_archive(client, rows, factory, progress=None):
 
 
 def last_used_row(client, sid, total_rows, columns):
-    """从表格底部往上读，找到真正有内容的最后一行（任何一列有值都算，包括图片）。"""
+    """从表格底部往上读，找到真正有内容的最后一行（任何一列有值都算，包括图片）。
+    远离主体的零散字符（整行只有一个空格、S、` 之类）是误输入，不当作最后一行。"""
     right = openpyxl.utils.get_column_letter(min(max(columns, 1), 200))
     end = total_rows
+    stray = None
     while end >= 1:
         start = max(1, end - 1999)
         data = checked(HTTP.get(f"{BASE}/sheets/v2/spreadsheets/{TOKEN}/values/{sid}!A{start}:{right}{end}",
@@ -498,10 +501,18 @@ def last_used_row(client, sid, total_rows, columns):
                                 timeout=60))
         values = (data.get("valueRange") or {}).get("values") or []
         for offset in range(len(values) - 1, -1, -1):
-            if any(v not in (None, "") for v in (values[offset] or [])):
-                return start + offset
+            row = start + offset
+            cells = [v for v in (values[offset] or []) if v is not None and str(v).strip()]
+            if not cells:
+                continue
+            if stray is not None and stray - row <= STRAY_GAP:
+                return stray  # 离上面内容很近，是正常内容，不算误输入
+            if len(cells) == 1 and len(str(cells[0]).strip()) <= 2:
+                stray = row  # 只有一两个字的孤立格子，先看看上面是不是紧挨着正常内容
+                continue
+            return row
         end = start - 1
-    return 0
+    return stray or 0
 
 
 def progress_ticker(rows, progress):

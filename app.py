@@ -26,7 +26,7 @@ st.set_page_config(page_title="聚水潭入库生成", page_icon="💎", layout=
 
 st.title("💎 聚水潭入库 Excel 生成")
 st.caption("上传出货单 → 核对金价 → 生成文件或同步成本")
-st.caption("版本：2026.11.11.1 · 流水链接")
+st.caption("版本：2026.11.11.2 · 流水去空白、链接直达工厂表")
 
 # ---------------- 飞书工具 ----------------
 def _fetch_after_update(client, key, target_cost, max_wait=4):
@@ -412,7 +412,8 @@ def archive_completed(data, source_path, items, factory, filename, flow):
         title = append_archive(archive_client, rows, factory, progress)
         finish('written')
         bar.empty()
-        st.success(f"已写入工厂流水（{title}）　[打开流水]({FLOW_URL})")
+        link = FLOW_URL + (f"?sheet={rows.sheet_id}" if getattr(rows, "sheet_id", None) else "")
+        st.success(f"已写入工厂流水（{title}）　[打开流水]({link})")
         if rows.images:
             done = len(rows.images) - rows.image_failed
             if rows.image_failed:
