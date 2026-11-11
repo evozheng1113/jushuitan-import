@@ -26,7 +26,7 @@ st.set_page_config(page_title="聚水潭入库生成", page_icon="💎", layout=
 
 st.title("💎 聚水潭入库 Excel 生成")
 st.caption("上传出货单 → 核对金价 → 生成文件或同步成本")
-st.caption("版本：2026.11.11 · 流水写回一份表")
+st.caption("版本：2026.11.11.1 · 流水链接")
 
 # ---------------- 飞书工具 ----------------
 def _fetch_after_update(client, key, target_cost, max_wait=4):
@@ -363,6 +363,9 @@ def finish_run():
         archive_completed(*archive_queue.pop(0))
 
 
+FLOW_URL = "https://icnikyg9yylq.feishu.cn/sheets/VWlWsPmI9h5YMgtmHlNcHdgHnFh"  # 所有工厂流水汇总在这一份表
+
+
 def archive_completed(data, source_path, items, factory, filename, flow):
     from factory_archive import ArchiveUncertain, LayoutIncomplete, NAMES
     from upload_registry import ARCHIVE_BLOCKING, ARCHIVE_LABELS, archive_state, record_action, status_lines
@@ -409,8 +412,7 @@ def archive_completed(data, source_path, items, factory, filename, flow):
         title = append_archive(archive_client, rows, factory, progress)
         finish('written')
         bar.empty()
-        end_row = rows.first_row + len(rows) - 1
-        st.success(f"已写入工厂流水 · {title} 第 {rows.first_row}–{end_row} 行")
+        st.success(f"已写入工厂流水（{title}）　[打开流水]({FLOW_URL})")
         if rows.images:
             done = len(rows.images) - rows.image_failed
             if rows.image_failed:
