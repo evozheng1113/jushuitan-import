@@ -171,10 +171,9 @@ def cell_style(cell):
         style["hAlign"] = {"left": 0, "center": 1, "right": 2}[cell.alignment.horizontal]
     if cell.alignment.vertical in ("top", "center", "bottom"):
         style["vAlign"] = {"top": 0, "center": 1, "bottom": 2}[cell.alignment.vertical]
-    sides = [cell.border.left, cell.border.right, cell.border.top, cell.border.bottom]
-    if all(side is not None and side.style for side in sides):
-        style["borderType"] = "FULL_BORDER"
-        style["borderColor"] = rgb(sides[0].color) or "#000000"
+    # 用户 2026-11-12：流水整块全边框，统一黑色细线，比照原表零散的边框更整齐。
+    style["borderType"] = "FULL_BORDER"
+    style["borderColor"] = "#000000"
     return style
 
 
@@ -267,6 +266,11 @@ def snapshot(data, source_path, items, factory, filename, flow):
                     raise ValueError(f"{sn}的合并单元格跨批次，未归档")
                 width = max(width, merged.max_col)
                 end = max(end, merged.max_row)
+            # 空格子的合并（如修理单没填的单号、重量）也要照原表合并，否则每件下面会散成空格。
+            # 只收完全落在本批范围内的，远处仅带格式的空白合并不影响范围。
+            merges += [m for m in fs.merged_cells.ranges
+                       if start <= m.min_row and m.max_row <= end and m.max_col <= width
+                       and fs.cell(m.min_row, m.min_col).value is None]
             if width > 500 or end-start+1 > 4998:
                 raise ValueError("完成单范围过大，未归档，请核对原文件的有效范围")
             # 用原出货单计算，金价或成本变化不影响判断；行号取相对值，不受批次位置影响。
@@ -473,6 +477,7 @@ def append_archive(client, rows, factory, progress=None):
         raise
     rows.first_row = first_row
     rows.sheet_id = sid
+    rows.gap_above = first_row - used - 1 if used else 0  # 上一批和本批之间的空行，也要加边框
     if used:
         rows.widths = {}  # 列宽对整张表生效，表里已有内容时沿用原列宽
     if isinstance(rows, CompletedSheetRows):
@@ -532,6 +537,16 @@ def apply_layout(client, sid, rows, first_row, tick=None):
         return f"{sid}!{openpyxl.utils.get_column_letter(left)}{first_row+top-1}:{openpyxl.utils.get_column_letter(right)}{first_row+bottom-1}"
     base = f"{BASE}/sheets/v2/spreadsheets/{TOKEN}"
     groups = {}
+    # 用户 2026-11-12：整个流水表全边框，批次之间的空行、本批末尾的空行也加。
+    width = max(map(len, rows))
+    styled = {row for row, *_ in rows.styles}
+    plain = [r for r in range(1, len(rows) + 1) if r not in styled]
+    plain += list(range(1 - getattr(rows, "gap_above", 0), 1))
+    border_only = {"borderType": "FULL_BORDER", "borderColor": "#000000"}
+    for row in plain:
+        group = groups.setdefault("border_only", {"ranges": [], "style": border_only})
+        for c in range(1, width+1, 100):
+            group["ranges"].append(address(row, c, row, min(width, c+99)))
     for row, left, right, style in rows.styles:
         key = json.dumps(style, sort_keys=True)
         group = groups.setdefault(key, {"ranges": [], "style": style})

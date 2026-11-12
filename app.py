@@ -26,7 +26,7 @@ st.set_page_config(page_title="聚水潭入库生成", page_icon="💎", layout=
 
 st.title("💎 聚水潭入库 Excel 生成")
 st.caption("上传出货单 → 核对金价 → 生成文件或同步成本")
-st.caption("版本：2026.11.11.2 · 流水去空白、链接直达工厂表")
+st.caption("版本：2026.11.12.1 · 一次上传多份、流水合并照原表、整表全边框")
 
 # ---------------- 飞书工具 ----------------
 def _fetch_after_update(client, key, target_cost, max_wait=4):
@@ -126,63 +126,94 @@ def load_upload(file):
     return ConvertedUpload(file.name.rsplit('.', 1)[0] + '.xlsx', cache[key])
 
 
-uploaded = st.file_uploader(
-    "选择工厂出货单 (.xlsx / .xls)",
-    type=['xlsx', 'xls'],
-    help="支持: 雅希(广州) / 倾诚(二厂) / 黛宝(三厂) / 猛哥(四厂) / 布心(天然钻)"
-)
-try:
-    uploaded = load_upload(uploaded)
-except Exception as exc:
-    st.error(f"无法读取这份 .xls：{exc}。请用 Excel/WPS 另存为 .xlsx 后再上传。")
-    st.stop()
+def file_key(file):
+    return hashlib.sha256(file.getvalue()).hexdigest()
 
+
+picked = st.file_uploader(
+    "选择工厂出货单 (.xlsx / .xls)，可以一次选多份",
+    type=['xlsx', 'xls'],
+    accept_multiple_files=True,
+    help="支持: 雅希(广州) / 倾诚(二厂) / 黛宝(三厂) / 猛哥(四厂) / 布心(天然钻)。多份会按顺序一份一份处理。"
+)
+uploads = []
+for file in picked or []:
+    try:
+        file = load_upload(file)
+    except Exception as exc:
+        st.error(f"无法读取 {file.name}：{exc}。请用 Excel/WPS 另存为 .xlsx 后再上传。")
+        st.stop()
+    if any(file_key(file) == file_key(other) for other in uploads):
+        st.warning(f"{file.name} 和前面一份内容完全相同，只处理一次。")
+        continue
+    uploads.append(file)
+uploaded = uploads[0] if uploads else None
+upload_key = None
+upload_info = {}
+action_status = None
 archive_repeat_key = None
-# 文件历史与成本成功状态分开；记录失败不当成首次上传。
-if uploaded and feishu_ready:
-    upload_key = hashlib.sha256(uploaded.getvalue()).hexdigest()
+file_context = {}
+
+
+def check_upload(file):
+    """每份文件单独核对上传和处理记录。文件历史与成本成功状态分开；记录失败不当成首次上传。"""
+    key = file_key(file)
     upload_cache = st.session_state.setdefault('_upload_checks_v3', {})
-    if upload_key not in upload_cache:
+    if key not in upload_cache:
         try:
             from upload_registry import check_and_record
             from finished_products import FinishedProductsClient
             upload_id, upload_secret = load_credentials()
             upload_client = FinishedProductsClient(upload_id, upload_secret)
-            upload_cache[upload_key] = check_and_record(upload_client, uploaded.getvalue(), uploaded.name)
+            upload_cache[key] = check_and_record(upload_client, file.getvalue(), file.name)
         except Exception as exc:
-            upload_cache[upload_key] = {'unknown': True, 'reason': str(exc)[:500]}
-    upload_info = upload_cache[upload_key]
-    if upload_info.get('unknown'):
+            upload_cache[key] = {'unknown': True, 'reason': str(exc)[:500]}
+    info = upload_cache[key]
+    if len(uploads) > 1:
+        st.markdown(f"**{file.name}**")
+    if info.get('unknown'):
         st.warning("上传记录查询失败，尚无法判断是否上传过。")
         with st.expander("查看失败原因"):
-            st.text(upload_info.get('reason') or '请点击重查，获取具体原因。')
-        if st.button("重查上传记录"):
-            upload_cache.pop(upload_key, None)
+            st.text(info.get('reason') or '请点击重查，获取具体原因。')
+        if st.button("重查上传记录", key=f"recheck_upload_{key}"):
+            upload_cache.pop(key, None)
             st.rerun()
-    elif upload_info.get('record_error'):
+    elif info.get('record_error'):
         st.warning("已核对，未找到历史上传记录；本次记录保存失败。")
         with st.expander("查看失败原因"):
-            st.text(upload_info['record_error'])
-        if st.button("重试保存上传记录"):
-            upload_cache.pop(upload_key, None)
+            st.text(info['record_error'])
+        if st.button("重试保存上传记录", key=f"retry_upload_{key}"):
+            upload_cache.pop(key, None)
             st.rerun()
     else:
-        st.caption("已加载过" if upload_info.get('seen') else "首次加载")
-    action_status = st.empty()
-    if not upload_info.get('unknown'):
+        st.caption("已加载过" if info.get('seen') else "首次加载")
+    status = st.empty()
+    repeat_key = None
+    if not info.get('unknown'):
         from upload_registry import status_lines
-        if upload_info.get('action_record_error'):
-            action_status.warning("上次操作记录保存失败，请重查处理记录。")
+        if info.get('action_record_error'):
+            status.warning("上次操作记录保存失败，请重查处理记录。")
         else:
-            action_status.info("\n\n".join(status_lines(upload_info)))
-        if upload_info.get('archives'):
-            archive_repeat_key = f"archive_repeat_{upload_key}_{upload_info.get('archive_count', 0)}"
-            st.checkbox("这批工厂单已写过流水，本次确实要再写一份", value=False, key=archive_repeat_key,
+            status.info("\n\n".join(status_lines(info)))
+        if info.get('archives'):
+            repeat_key = f"archive_repeat_{key}_{info.get('archive_count', 0)}"
+            st.checkbox("这批工厂单已写过流水，本次确实要再写一份", value=False, key=repeat_key,
                         help="只影响这一次。请先确认流水里没有这批，或确实需要重复写入。")
-    if not upload_info.get('unknown') and not upload_info.get('record_error'):
-        if st.button("重查处理记录"):
-            upload_cache.pop(upload_key, None)
+    if not info.get('unknown') and not info.get('record_error'):
+        if st.button("重查处理记录", key=f"recheck_actions_{key}"):
+            upload_cache.pop(key, None)
             st.rerun()
+    return dict(upload_key=key, upload_info=info, action_status=status, archive_repeat_key=repeat_key)
+
+
+if uploads and feishu_ready:
+    for file in uploads:
+        file_context[file_key(file)] = check_upload(file)
+if uploaded is not None:
+    context = file_context.get(file_key(uploaded))
+    if context:
+        upload_key, upload_info = context['upload_key'], context['upload_info']
+        action_status, archive_repeat_key = context['action_status'], context['archive_repeat_key']
 
 factory_label = st.selectbox(
     "工厂",
@@ -237,11 +268,29 @@ if sync_feishu:
         debug_mode = st.checkbox("显示诊断信息", value=False)
 
 buxin_initial = {'PT950': False, '18K': False}
-if uploaded and sync_feishu and ('ZC' in uploaded.name.upper() or '布心' in factory_label):
-    with st.expander("布心首次接入：核对已有成本"):
-        st.caption("仅在首次接入遇到已有成本时使用。分别确认本文件最后一批是否尚未同步；不确定就不勾选。以后自动跳过已同步出货。")
-        buxin_initial['PT950'] = st.checkbox("确认 PT 最后一批尚未同步，允许更新已有成本", key='buxin_pt_' + hashlib.sha256(uploaded.getvalue()).hexdigest())
-        buxin_initial['18K'] = st.checkbox("确认 18K 最后一批尚未同步，允许更新已有成本", key='buxin_18k_' + hashlib.sha256(uploaded.getvalue()).hexdigest())
+buxin_by_file = {}
+if sync_feishu:
+    for file in uploads:
+        if 'ZC' in file.name.upper() or '布心' in factory_label:
+            key = file_key(file)
+            with st.expander(f"布心首次接入：核对已有成本（{file.name}）"):
+                st.caption("仅在首次接入遇到已有成本时使用。分别确认本文件最后一批是否尚未同步；不确定就不勾选。以后自动跳过已同步出货。")
+                buxin_by_file[key] = {
+                    'PT950': st.checkbox("确认 PT 最后一批尚未同步，允许更新已有成本", key='buxin_pt_' + key),
+                    '18K': st.checkbox("确认 18K 最后一批尚未同步，允许更新已有成本", key='buxin_18k_' + key)}
+
+
+def use_file(file):
+    """切换到这一份文件：后面的记录、流水防重复都按这份文件来。"""
+    global uploaded, upload_key, upload_info, action_status, archive_repeat_key, buxin_initial
+    uploaded = file
+    key = file_key(file)
+    context = file_context.get(key)
+    if context is None:
+        context = dict(upload_key=key, upload_info={}, action_status=st.empty(), archive_repeat_key=None)
+    upload_key, upload_info = context['upload_key'], context['upload_info']
+    action_status, archive_repeat_key = context['action_status'], context['archive_repeat_key']
+    buxin_initial = buxin_by_file.get(key, {'PT950': False, '18K': False})
 
 
 def remember_action(event):
@@ -343,24 +392,36 @@ archive_queue = []
 
 
 def queue_archive(data, source_path, items, factory, filename, flow):
-    """流水最慢，排到所有成本写完之后。猛哥双份流程是同一张表，只写一次。"""
+    """流水最慢，排到所有单子的成本写完之后。猛哥双份流程是同一张表，同一份文件只写一次。"""
     from factory_archive import NAMES
     name = NAMES.get(factory, factory)
-    if any(NAMES.get(job[3], job[3]) == name for job in archive_queue):
+    if any(NAMES.get(job[0][3], job[0][3]) == name and job[1]['upload_key'] == upload_key for job in archive_queue):
         return
-    archive_queue.append((data, source_path, items, factory, filename, flow))
+    context = dict(uploaded=uploaded, upload_key=upload_key, upload_info=upload_info, action_status=action_status,
+                   archive_repeat_key=archive_repeat_key, current_run_id=current_run_id)
+    archive_queue.append(((data, source_path, items, factory, filename, flow), context))
     st.info("完成单现在就可以下载。工厂流水会在页面最下方写入，写完前请勿关闭或刷新页面。")
 
 
 def finish_run():
-    """成本结果先落定，再写流水；写流水慢或被中断都不影响成本。"""
+    """这份单的成本结果先落定；流水等所有单子处理完再写，写流水慢或被中断都不影响成本。"""
     if cost_progress is not None:
         remember_action(cost_progress.event(complete=True))
+
+
+def flush_archives():
+    global uploaded, upload_key, upload_info, action_status, archive_repeat_key, current_run_id
     if archive_queue:
         st.divider()
         st.subheader("📒 写入工厂流水")
     while archive_queue:
-        archive_completed(*archive_queue.pop(0))
+        job, context = archive_queue.pop(0)
+        uploaded, upload_key, upload_info = context['uploaded'], context['upload_key'], context['upload_info']
+        action_status, archive_repeat_key = context['action_status'], context['archive_repeat_key']
+        current_run_id = context['current_run_id']
+        if len(uploads) > 1:
+            st.caption(uploaded.name)
+        archive_completed(*job)
 
 
 FLOW_URL = "https://icnikyg9yylq.feishu.cn/sheets/VWlWsPmI9h5YMgtmHlNcHdgHnFh"  # 所有工厂流水汇总在这一份表
@@ -885,16 +946,15 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
     return len(items)
 
 
-# v13: 天然钻石按文件名自动识别 (猛哥单子文件名都会写)
 is_natural = False
-if uploaded is not None:
+
+# ---------------- 主流程 ----------------
+def run_one():
+    """处理一份工厂单。出错只影响这一份，后面的照常处理。"""
+    global current_run_id, cost_progress, is_natural
     is_natural = detect_is_natural(uploaded.name)
     if is_natural:
         st.info("💎 文件名含「天然钻石」→ 主石类别会写'天然钻石', 商品名加'天然'前缀")
-
-# ---------------- 主流程 ----------------
-# v15: 只要有上传文件就能跑 (即使两个附加任务都没勾, 工厂单完成文件也会生成)
-if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
     from upload_registry import CostProgress
     current_run_id = uuid.uuid4().hex
     cost_progress = CostProgress(current_run_id) if sync_feishu else None
@@ -913,7 +973,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
             if not code:
                 st.error(f"❌ 文件名 `{uploaded.name}` 无法自动识别工厂，请上方手动选择")
                 os.unlink(in_path)
-                st.stop()
+                return
         elif factory_label.startswith("布心"):
             code = 'BUXIN'   # 布心走独立文件, 天然钻专属
         else:
@@ -938,21 +998,21 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
         # v19: 单纯天然钻工厂 (布心 / 黛宝 / 二厂) → 只跑天然流程, 跳过培育
         if spots_only and is_natural and code != 'E':
             st.error("天然钻单的现货不会被流水打断，不需要补写。")
-            st.stop()
+            return
         if is_natural and code != 'E':
             natural_factory = detect_natural_factory_name(code, uploaded.name)
             if not natural_factory:
                 st.error(f"❌ 无法定位天然钻 parser (code={code}, 文件={uploaded.name})")
                 try: os.unlink(in_path)
                 except OSError: pass
-                st.stop()
+                return
             run_natural_workflow(in_path, uploaded.name, natural_factory, pt, au,
                                  gia_months=GIA_MONTHS, sync_feishu=sync_feishu)
             run_complete = True
             finish_run()
             try: os.unlink(in_path)
             except OSError: pass
-            st.stop()
+            return
 
         default_material = detect_default_material(uploaded.name)
         parse_kwargs = dict(pt_price=pt, au_price=au)
@@ -969,7 +1029,7 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
             else:
                 sync_finished_spots(items)
             run_complete = True
-            st.stop()
+            return
 
         clients = [it for it in items if it['类别'] == '客户单']
         spots = [it for it in items if it['类别'] in ('现货', '部门-真诚-现货')]
@@ -1350,6 +1410,18 @@ if st.button("🚀 开始", disabled=uploaded is None, type="primary"):
     finally:
         if cost_progress is not None:
             remember_action(cost_progress.event(complete=run_complete))
+
+
+current_run_id = None
+cost_progress = None
+if st.button("🚀 开始", disabled=not uploads, type="primary"):
+    for number, file in enumerate(uploads, 1):
+        use_file(file)
+        if len(uploads) > 1:
+            st.divider()
+            st.header(f"📄 第 {number}/{len(uploads)} 份：{file.name}")
+        run_one()
+    flush_archives()  # 所有单子的成本都写完，最后统一写工厂流水
 
 # ---------------- 本次会话历史 ----------------
 st.divider()
