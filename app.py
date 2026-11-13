@@ -26,7 +26,7 @@ st.set_page_config(page_title="聚水潭入库生成", page_icon="💎", layout=
 
 st.title("💎 聚水潭入库 Excel 生成")
 st.caption("上传出货单 → 核对金价 → 生成文件或同步成本")
-st.caption("版本：2026.11.12.1 · 一次上传多份、流水合并照原表、整表全边框")
+st.caption("版本：2026.11.13.1 · 多份上传修复：流水找不到文件、旧文件不重复处理")
 
 # ---------------- 飞书工具 ----------------
 def _fetch_after_update(client, key, target_cost, max_wait=4):
@@ -147,6 +147,7 @@ for file in picked or []:
         st.warning(f"{file.name} 和前面一份内容完全相同，只处理一次。")
         continue
     uploads.append(file)
+processed_keys = st.session_state.setdefault('_processed_keys', set())
 uploaded = uploads[0] if uploads else None
 upload_key = None
 upload_info = {}
@@ -399,7 +400,11 @@ def queue_archive(data, source_path, items, factory, filename, flow):
         return
     context = dict(uploaded=uploaded, upload_key=upload_key, upload_info=upload_info, action_status=action_status,
                    archive_repeat_key=archive_repeat_key, current_run_id=current_run_id)
-    archive_queue.append(((data, source_path, items, factory, filename, flow), context))
+    # 原出货单的临时文件在这份单处理完就会删掉，流水要等所有单子写完成本才写，
+    # 所以先另存一份给流水用，写完流水再删（2026-11-13 出过“找不到文件”）。
+    with open(source_path, 'rb') as src, tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as keep:
+        keep.write(src.read())
+    archive_queue.append(((data, keep.name, items, factory, filename, flow), context))
     st.info("完成单现在就可以下载。工厂流水会在页面最下方写入，写完前请勿关闭或刷新页面。")
 
 
@@ -411,6 +416,7 @@ def finish_run():
 
 def flush_archives():
     global uploaded, upload_key, upload_info, action_status, archive_repeat_key, current_run_id
+    archive_files = {job[1]['upload_key'] for job in archive_queue}
     if archive_queue:
         st.divider()
         st.subheader("📒 写入工厂流水")
@@ -419,9 +425,15 @@ def flush_archives():
         uploaded, upload_key, upload_info = context['uploaded'], context['upload_key'], context['upload_info']
         action_status, archive_repeat_key = context['action_status'], context['archive_repeat_key']
         current_run_id = context['current_run_id']
-        if len(uploads) > 1:
+        if len(archive_files) > 1:
             st.caption(uploaded.name)
-        archive_completed(*job)
+        try:
+            archive_completed(*job)
+        finally:
+            try:
+                os.unlink(job[1])
+            except OSError:
+                pass
 
 
 FLOW_URL = "https://icnikyg9yylq.feishu.cn/sheets/VWlWsPmI9h5YMgtmHlNcHdgHnFh"  # 所有工厂流水汇总在这一份表
@@ -1415,13 +1427,23 @@ def run_one():
 current_run_id = None
 cost_progress = None
 if st.button("🚀 开始", disabled=not uploads, type="primary"):
-    for number, file in enumerate(uploads, 1):
+    # 旧文件还留在框里、又拖进了新文件时，只处理新的，免得成本重复叠加。
+    todo = [f for f in uploads if file_key(f) not in processed_keys] or uploads
+    for skipped in [f for f in uploads if f not in todo]:
+        st.caption(f"已跳过（这一页刚处理过，不重复写成本）：{skipped.name}")
+    if len(todo) > 1:
+        st.info(f"本次共 {len(todo)} 份，按顺序一份一份处理，全部完成会在最下面提示，期间请勿关闭或刷新页面：\n\n"
+                + "\n\n".join(f"{n}. {f.name}" for n, f in enumerate(todo, 1)))
+    for number, file in enumerate(todo, 1):
         use_file(file)
-        if len(uploads) > 1:
+        if len(todo) > 1:
             st.divider()
-            st.header(f"📄 第 {number}/{len(uploads)} 份：{file.name}")
+            st.header(f"📄 第 {number}/{len(todo)} 份：{file.name}")
+        processed_keys.add(file_key(file))
         run_one()
     flush_archives()  # 所有单子的成本都写完，最后统一写工厂流水
+    if len(todo) > 1:
+        st.success(f"✅ {len(todo)} 份全部处理完。")
 
 # ---------------- 本次会话历史 ----------------
 st.divider()
