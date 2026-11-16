@@ -194,9 +194,21 @@ def sheet_images(ws, offset, start, end, width):
     return found
 
 
-def write_images(client, sid, rows, first_row, tick=None):
-    """图片失败只记数，数字文字已写好，这里绝不抛错。"""
+def write_images(client, sid, rows, first_row, tick=None, unmerge=False):
+    """图片失败只记数，数字文字已写好，这里绝不抛错。
+    飞书不能往已合并的格子里放图（2026-11-16：11-012 雅希 29 张图全没写进），
+    所以新批次先放图、再合并；补图时先拆开图片所在的合并格，放完图由 apply_layout 重新合并。"""
     headers = client._headers(json_body=True)
+    if unmerge:
+        for top, left, bottom, right in rows.merges:
+            if any(top <= index+1 <= bottom and left <= col <= right for index, col, *_ in rows.images):
+                area = (f"{sid}!{openpyxl.utils.get_column_letter(left)}{first_row+top-1}:"
+                        f"{openpyxl.utils.get_column_letter(right)}{first_row+bottom-1}")
+                try:
+                    layout_call("post", f"{BASE}/sheets/v2/spreadsheets/{TOKEN}/unmerge_cells",
+                                headers=headers, json={"range": area}, timeout=30)
+                except (ArchiveAPIError, requests.exceptions.RequestException, ValueError):
+                    pass  # 本来没合并或拆不开，照常放图，失败会计数
 
     def task(index, col, data, name):
         cell = f"{openpyxl.utils.get_column_letter(col)}{first_row+index}"
@@ -483,11 +495,11 @@ def append_archive(client, rows, factory, progress=None):
     if isinstance(rows, CompletedSheetRows):
         layout_error = None
         tick = progress_ticker(rows, progress)
+        write_images(client, sid, rows, first_row, tick)  # 先放图，再合并（合并格放不进图）
         try:
             apply_layout(client, sid, rows, first_row, tick)
         except Exception as exc:
             layout_error = exc
-        write_images(client, sid, rows, first_row, tick)
         if layout_error is not None:
             raise LayoutIncomplete(sheet["title"], sid, first_row, rows, layout_error) from layout_error
     return sheet["title"]
@@ -659,6 +671,6 @@ def repair_layout(client, rows, factory, first_row):
                     legacy = getattr(rows, "old_dates", {}).get((start+r, c), ())
                     if not same_value(got, want) and not any(same_value(got, old) for old in legacy):
                         raise ValueError(f"第{first_row+start+r}行第{c+1}列与完成文件不一致，未修改；请核对文件、sheet和起始行")
-    apply_layout(client, sid, rows, first_row)
-    write_images(client, sid, rows, first_row)  # 中断过的批次在这里补图，同格重写不会重复
+    write_images(client, sid, rows, first_row, unmerge=True)  # 中断或漏图的批次在这里补图，同格重写不会重复
+    apply_layout(client, sid, rows, first_row)  # 重新合并、补格式
     return matches[0]["title"]
