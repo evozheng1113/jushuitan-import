@@ -26,7 +26,7 @@ st.set_page_config(page_title="聚水潭入库生成", page_icon="💎", layout=
 
 st.title("💎 聚水潭入库 Excel 生成")
 st.caption("上传出货单 → 核对金价 → 生成文件或同步成本")
-st.caption("版本：2026.11.13.1 · 多份上传修复：流水找不到文件、旧文件不重复处理")
+st.caption("版本：2026.11.16.1 · 认不出格式的单子直接拒绝")
 
 # ---------------- 飞书工具 ----------------
 def _fetch_after_update(client, key, target_cost, max_wait=4):
@@ -969,10 +969,8 @@ def run_one():
         st.info("💎 文件名含「天然钻石」→ 主石类别会写'天然钻石', 商品名加'天然'前缀")
     from upload_registry import CostProgress
     current_run_id = uuid.uuid4().hex
-    cost_progress = CostProgress(current_run_id) if sync_feishu else None
+    cost_progress = None  # 格式核对通过后才开始记成本进度
     run_complete = False
-    if cost_progress is not None:
-        remember_action(cost_progress.event())
     try:
         suffix = '.xlsx'
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
@@ -1002,6 +1000,22 @@ def run_one():
         # BUXIN 是布心天然专用 code (培育钻网站没有布心工厂)
         if code == 'BUXIN':
             is_natural = True
+
+        # 文件名只能猜工厂；表头对不上这家工厂的格式就整份拒绝，不查飞书、不出完成单、不写流水
+        # （2026-11-16：一份银饰出货明细表文件名带「郑国远」，被当成雅希写进了广州流水）。
+        import template_check
+        natural_factory = detect_natural_factory_name(code, uploaded.name) if is_natural else None
+        wrong = template_check.problem(in_path, template_check.kind_for(code, is_natural, natural_factory))
+        if wrong:
+            st.error(f"❌ {uploaded.name}：{wrong}")
+            refused.append(uploaded.name)
+            processed_keys.discard(file_key(uploaded))
+            try: os.unlink(in_path)
+            except OSError: pass
+            return
+        cost_progress = CostProgress(current_run_id) if sync_feishu else None
+        if cost_progress is not None:
+            remember_action(cost_progress.event())
 
         st.info(f"🏭 工厂: **{code}** | 铂 {pt} | 金 {au} | "
                 f"{'天然' if is_natural else '培育'}钻石 | "
@@ -1426,6 +1440,7 @@ def run_one():
 
 current_run_id = None
 cost_progress = None
+refused = []  # 本次格式对不上、没有处理的文件名
 if st.button("🚀 开始", disabled=not uploads, type="primary"):
     # 旧文件还留在框里、又拖进了新文件时，只处理新的，免得成本重复叠加。
     todo = [f for f in uploads if file_key(f) not in processed_keys] or uploads
@@ -1442,7 +1457,9 @@ if st.button("🚀 开始", disabled=not uploads, type="primary"):
         processed_keys.add(file_key(file))
         run_one()
     flush_archives()  # 所有单子的成本都写完，最后统一写工厂流水
-    if len(todo) > 1:
+    if len(todo) > 1 and refused:
+        st.warning(f"{len(todo) - len(refused)} 份处理完；{len(refused)} 份格式不对没有处理：{'、'.join(refused)}")
+    elif len(todo) > 1:
         st.success(f"✅ {len(todo)} 份全部处理完。")
 
 # ---------------- 本次会话历史 ----------------
