@@ -211,6 +211,14 @@ def build_row_from_item(item, factory_code, feishu_cert,
     if feishu_ring_size and category == '戒指':
         row['指圈号'] = str(feishu_ring_size).strip()
 
+    # 猛哥：工厂单 F 列手寸优先写进指圈号。排戒、v排这类认不出品类的也写；
+    # 手链等明确不是戒指的不写（手链的手寸是长度，如 18cm）。
+    ring = item.get('手寸') if factory_code == 'E' else None
+    if isinstance(ring, float) and ring.is_integer():
+        ring = int(ring)
+    if ring is not None and str(ring).strip() and category in (None, '戒指'):
+        row['指圈号'] = str(ring).strip()
+
     row['成本2'] = item.get('镶嵌成本')
     cost1 = (feishu_luozuan or 0) + (feishu_peishi or 0)
     row['成本1'] = round(cost1, 2) if cost1 > 0 else None

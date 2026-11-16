@@ -855,8 +855,9 @@ def parse_E(excel_path, pt_price, au_price, sheet_name=None, default_material=No
         else:
             cat, fly_key, customer = '客户单', invoice_s, None
 
+        ring = ws.cell(row=r, column=COL['手寸']).value if COL.get('手寸') else None
         items.append({'no': no, 'rows': [r], '类别': cat, '单号': invoice, '品名': pinming,
-                      '成色': material, '件数': qty,
+                      '成色': material, '件数': qty, '手寸': ring,
                       '总重': total_weight,
                       '主石重量': main_w if main_w > 0 else None,
                       '副石重量': side_w if side_w > 0 else None,
