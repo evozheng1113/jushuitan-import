@@ -26,7 +26,7 @@ st.set_page_config(page_title="聚水潭入库生成", page_icon="💎", layout=
 
 st.title("💎 聚水潭入库 Excel 生成")
 st.caption("上传出货单 → 核对金价 → 生成文件或同步成本")
-st.caption("版本：2026.11.16.3 · 雅希流水图片先放图再合并")
+st.caption("版本：2026.11.17.1 · 完成单自动发飞书群")
 
 # ---------------- 飞书工具 ----------------
 def _fetch_after_update(client, key, target_cost, max_wait=4):
@@ -406,6 +406,26 @@ def queue_archive(data, source_path, items, factory, filename, flow):
         keep.write(src.read())
     archive_queue.append(((data, keep.name, items, factory, filename, flow), context))
     st.info("完成单现在就可以下载。工厂流水会在页面最下方写入，写完前请勿关闭或刷新页面。")
+
+
+def send_to_group(data, filename):
+    """完成单发到飞书群（机器人即网站的飞书应用）。只在勾选同步成本的正式处理时发，同一页同一份只发一次；
+    失败只提示，不影响成本、完成单下载和流水。"""
+    if not sync_feishu:
+        return
+    sent = st.session_state.setdefault('_group_sent', set())
+    key = hashlib.sha256(data).hexdigest()
+    if key in sent:
+        return
+    try:
+        import feishu_group
+        from finished_products import FinishedProductsClient
+        creds = feishu_group.bot_credentials() or load_credentials()
+        chat = feishu_group.send_file(FinishedProductsClient(*creds)._headers(), data, filename)
+        sent.add(key)
+        st.caption(f"完成单已发到飞书群「{chat}」")
+    except Exception as exc:
+        st.warning(f"完成单没发到飞书群（{exc}），请手动下载。")
 
 
 def finish_run():
@@ -941,6 +961,7 @@ def run_natural_workflow(in_path, uploaded_name, factory_name, pt, au, gia_month
         )
         remember_generated()
         queue_archive(complete_data, in_path, items, factory_name, complete_fname, "真诚")
+        send_to_group(complete_data, complete_fname)
         st.caption("完成文件在原表最右侧追加: 总镶嵌成本 | 客户名称 | 利润 | 利润率")
         st.session_state.setdefault('history', []).append({
             '时间': datetime.now().strftime('%H:%M:%S'),
@@ -1317,6 +1338,7 @@ def run_one():
             )
             remember_generated()
             queue_archive(done_data, in_path, items, code, done_fname, "常规")
+            send_to_group(done_data, done_fname)
             cap_parts = []
             if clients: cap_parts.append("客户名/利润/利润率")
             if spots: cap_parts.append("现货 AD 单价成本")
